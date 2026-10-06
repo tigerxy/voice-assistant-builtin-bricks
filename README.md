@@ -110,6 +110,27 @@ staying on the stock bricks.
 By default TTS uses the first plugged speaker. To force a specific ALSA device,
 see the commented `Speaker(...)` line in `python/main.py`.
 
+## Tests
+
+The tests run on any computer with Python 3.10+, no board and no extra packages needed:
+
+```bash
+python3 -m unittest discover -s tests -b -v
+```
+
+- `tests/test_assistant.py` runs `python/main.py` against fake bricks
+  (`tests/fakes.py`) and checks the conversation flow, follow-ups, exit phrases,
+  quick replies, filler words, tools (web search, weather, emotions), sound
+  effects, the idle face timer and that `app.yaml`, `main.py` and `sketch.ino`
+  agree with each other.
+- `tests/test_sketch.py` compiles the real `sketch.ino` for your computer with small
+  stand-ins for the Arduino libraries (`tests/sketch_host/`) and checks the LED
+  frames: idle eyes, blinking, sleeping face, scanner, waves and all emotion
+  symbols. It needs `g++` or `clang++` and is skipped otherwise.
+
+They can't replace a test on the real VENTUNO Q: audio, the AI models and the
+LED hardware are simulated.
+
 ## Project layout
 
 ```
@@ -117,6 +138,7 @@ app.yaml
 python/main.py
 sketch/sketch.ino
 sketch/sketch.yaml
+tests/              # unit tests, see "Tests"
 ```
 
 ## License

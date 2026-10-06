@@ -1,0 +1,274 @@
+"""Fake versions of the Arduino App Lab bricks (and `requests`) used by python/main.py.
+
+They let the app run on any computer without the VENTUNO Q hardware. Every fake
+writes what happens into one shared, ordered event log, so tests can check both
+*what* the assistant did and *in which order* (e.g. "chime before listening").
+
+Events are tuples:
+    ("bridge", rpc_name, arg)      Bridge.call to the MCU sketch
+    ("speak", text, block)         TextToSpeech.speak
+    ("tone", note)                 SoundGenerator.play_tone
+    ("listen", seconds)            ASR transcribe_stream started
+    ("llm", prompt)                LLM chat_stream called
+    ("clear_memory",)              LLM memory cleared
+    ("http", url)                  web request
+    ("weather", city, kwargs)      WeatherForecast lookup
+"""
+
+import sys
+import threading
+import types
+from contextlib import contextmanager
+from urllib.parse import quote
+
+
+class World:
+    """Shared state of all fakes. Reset before each test."""
+
+    def __init__(self):
+        self.events = []
+        self.utterances = []        # what the "user" says on each listen; "" = silence
+        self.llm_responder = None   # fn(prompt, tools) -> iterable of text chunks
+        self.http_routes = {}       # url prefix -> json payload, or Exception to raise
+        self.weather = ("Slight rain", "rainy")
+        self.keyword_callbacks = {}
+
+    def log(self, *event):
+        self.events.append(event)
+
+    def of(self, kind):
+        return [e for e in self.events if e[0] == kind]
+
+    def spoken(self):
+        return [e[1] for e in self.of("speak")]
+
+    def bridge(self, name=None):
+        return [e for e in self.of("bridge") if name is None or e[1] == name]
+
+    def index(self, predicate, start=0):
+        for i in range(start, len(self.events)):
+            if predicate(self.events[i]):
+                return i
+        return -1
+
+
+world = World()
+
+
+# --- arduino.app_utils --------------------------------------------------------
+class _Bridge:
+    @staticmethod
+    def call(name, *args):
+        world.log("bridge", name, args[0] if args else None)
+
+
+class _App:
+    @staticmethod
+    def run(user_loop=None):
+        pass  # tests drive main.loop() themselves
+
+
+# --- arduino.app_bricks.llm -----------------------------------------------------
+class LargeLanguageModel:
+    last = None
+
+    def __init__(self, system_prompt="", tools=None, **kwargs):
+        self.system_prompt = system_prompt
+        self.tools = {t.__name__: t for t in (tools or [])}
+        self.memory = None
+        LargeLanguageModel.last = self
+
+    def with_memory(self, max_messages=10, persistence=None):
+        self.memory = max_messages
+
+    def chat(self, message, images=None):
+        return "ok"
+
+    def chat_stream(self, message, images=None):
+        world.log("llm", message)
+        if world.llm_responder is None:
+            yield "Sure thing."
+            return
+        yield from world.llm_responder(message, self.tools)
+
+    def clear_memory(self):
+        world.log("clear_memory")
+
+
+# --- arduino.app_bricks.asr ---------------------------------------------------
+class _Chunk:
+    def __init__(self, type_, data):
+        self.type = type_
+        self.data = data
+
+
+class AutomaticSpeechRecognition:
+    def __init__(self, mic):
+        self.mic = mic
+
+    def start(self):
+        pass
+
+    def stop(self):
+        pass
+
+    @contextmanager
+    def transcribe_stream(self, duration=7):
+        world.log("listen", duration)
+        text = world.utterances.pop(0) if world.utterances else ""
+        chunks = []
+        if text:
+            chunks = [_Chunk("partial_text", text[: len(text) // 2]), _Chunk("full_text", text)]
+        yield iter(chunks)
+
+
+# --- arduino.app_bricks.keyword_spotting ----------------------------------------
+class KeywordSpotting:
+    def __init__(self, mic=None, confidence=0.8, debounce_sec=1.0):
+        self.confidence = confidence
+
+    def on_detect(self, label, callback):
+        world.keyword_callbacks[label] = callback
+
+    def start(self):
+        pass
+
+
+# --- arduino.app_bricks.tts ---------------------------------------------------
+class TextToSpeech:
+    def __init__(self, speaker=None, max_queue_size=128):
+        pass
+
+    def start(self):
+        pass
+
+    def stop(self):
+        pass
+
+    def speak(self, text, block=True):
+        world.log("speak", text, block)
+
+    def is_speaking(self):
+        return False
+
+    def cancel(self):
+        world.log("tts_cancel")
+
+
+# --- arduino.app_bricks.weather_forecast --------------------------------------------
+class _WeatherData:
+    def __init__(self, description, category):
+        self.description = description
+        self.category = category
+
+
+class WeatherForecast:
+    def get_forecast_by_city(self, city, timezone="GMT", forecast_days=1):
+        world.log("weather", city, {"timezone": timezone, "forecast_days": forecast_days})
+        return _WeatherData(*world.weather)
+
+
+# --- arduino.app_bricks.sound_generator ---------------------------------------------
+class SoundEffect:
+    @staticmethod
+    def adsr(*args, **kwargs):
+        return "adsr"
+
+
+class SoundGenerator:
+    def __init__(self, output_device=None, wave_form="sine", sound_effects=None, **kwargs):
+        pass
+
+    def start(self):
+        pass
+
+    def stop(self):
+        pass
+
+    def play_tone(self, note, duration=0.25, volume=None, block=False):
+        world.log("tone", note)
+
+
+# --- arduino.app_peripherals.microphone ----------------------------------------------
+class Microphone:
+    def __init__(self, *args, **kwargs):
+        pass
+
+    def start(self):
+        pass
+
+    def stop(self):
+        pass
+
+
+# --- requests (only what main.py uses) --------------------------------------------
+class _Response:
+    def __init__(self, payload):
+        self._payload = payload
+        self.ok = True
+        self.status_code = 200
+
+    def json(self):
+        return self._payload
+
+    def raise_for_status(self):
+        pass
+
+
+class _Session:
+    def __init__(self):
+        self.headers = {}
+
+    def get(self, url, params=None, timeout=None):
+        world.log("http", url)
+        for prefix, payload in world.http_routes.items():
+            if url.startswith(prefix):
+                if isinstance(payload, Exception):
+                    raise payload
+                return _Response(payload)
+        raise _ConnectionError(f"no route for {url}")
+
+
+class _ConnectionError(Exception):
+    pass
+
+
+class _ReadTimeout(Exception):
+    pass
+
+
+def install():
+    """Register the fake modules in sys.modules (idempotent)."""
+
+    def module(name, **attrs):
+        m = types.ModuleType(name)
+        m.__dict__.update(attrs)
+        sys.modules[name] = m
+        return m
+
+    module("arduino")
+    module("arduino.app_utils", App=_App, Bridge=_Bridge)
+    module("arduino.app_bricks")
+    module("arduino.app_bricks.llm", LargeLanguageModel=LargeLanguageModel)
+    module("arduino.app_bricks.asr", AutomaticSpeechRecognition=AutomaticSpeechRecognition)
+    module("arduino.app_bricks.keyword_spotting", KeywordSpotting=KeywordSpotting)
+    module("arduino.app_bricks.tts", TextToSpeech=TextToSpeech)
+    module("arduino.app_bricks.weather_forecast", WeatherForecast=WeatherForecast)
+    module("arduino.app_bricks.sound_generator", SoundGenerator=SoundGenerator, SoundEffect=SoundEffect)
+    module("arduino.app_peripherals")
+    module("arduino.app_peripherals.microphone", Microphone=Microphone)
+
+    exceptions = module("requests.exceptions", ConnectionError=_ConnectionError, ReadTimeout=_ReadTimeout)
+    utils = module("requests.utils", quote=quote)
+    module("requests", Session=_Session, exceptions=exceptions, utils=utils)
+
+
+def reset():
+    global world
+    world.__init__()
+    return world
+
+
+# A tiny helper for tests that need the LLM to be slow without using time.sleep
+def wait(seconds):
+    threading.Event().wait(seconds)
