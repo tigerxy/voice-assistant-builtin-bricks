@@ -11,8 +11,40 @@ that drops the custom Kokoro brick and uses only Arduino App Lab's built-in bric
 | Speech-to-text | `arduino:asr` | `AutomaticSpeechRecognition` |
 | Local LLM (NPU) | `arduino:llm` | `LargeLanguageModel` |
 | Text-to-speech | `arduino:tts` | `TextToSpeech` |
+| Weather (LLM tool) | `arduino:weather_forecast` | `WeatherForecast` |
 
 No `bricks/` folder, no custom code to maintain.
+
+## Conversations
+
+Say **"Hey Arduino"** once, then talk normally:
+
+1. After each answer the assistant keeps listening for a follow-up
+   (`FOLLOW_UP_SECONDS`, default 6 s). No wake word needed.
+2. The LLM keeps the conversation history (`MEMORY_MESSAGES`), so follow-ups like
+   "and tomorrow?" or "how old is he?" work.
+3. The conversation ends when you stay silent, or say "stop", "bye", "goodbye",
+   "that's all" or "never mind". The history is then cleared, so the next
+   "Hey Arduino" starts fresh.
+
+The microphone only opens after the assistant has finished speaking, so it
+never hears itself. The trade-off: you can't interrupt it mid-answer.
+
+## Tools: web search and weather
+
+The local LLM can call two tools when it decides it needs them:
+
+- **`web_search(query)`**: looks things up via the DuckDuckGo Instant Answer API
+  and Wikipedia (no API key). There is no web search brick in Arduino's library,
+  so this is a small Python function passed to the LLM brick's `tools=` argument.
+  It's good for facts and background knowledge, not for breaking news.
+- **`get_weather(city, days_ahead)`**: uses the built-in `weather_forecast` brick
+  (open-meteo.com, no API key). It returns a description like "Slight rain",
+  not temperatures.
+
+Both need internet access on the board. If your LLM runner doesn't support tool
+calling, set `USE_TOOLS = False` in `main.py` and the assistant works offline
+without them.
 
 ## What changed vs. the Kokoro version
 
@@ -22,6 +54,7 @@ No `bricks/` folder, no custom code to maintain.
 - **Lower latency**: the LLM reply is streamed and each finished sentence is
   queued with `tts.speak(sentence, block=False)`, so the assistant starts
   talking before the LLM has finished generating.
+- **Real conversations** with follow-up questions, plus web search and weather tools (see above).
 - **Clean shutdown**: `tts.cancel()` on errors, `tts.stop()` on exit.
 - **Time zone** is a single constant (`TIME_ZONE`) at the top of `main.py`.
 - **Wake word** is now "Hey Arduino": the built-in keyword spotting model

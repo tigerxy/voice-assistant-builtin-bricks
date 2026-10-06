@@ -1,11 +1,12 @@
 name: Keyword-ASR-Local-LLM-TTS
-description: Offline voice assistant (keyword spotting, ASR, local LLM and TTS) built only from Arduino's built-in bricks.
+description: Local voice assistant with real conversations (keyword spotting, ASR, local LLM with web search and weather tools, TTS) built from Arduino's built-in bricks.
 ports: []
 bricks:
 - arduino:llm: {}
 - arduino:asr: {}
 - arduino:keyword_spotting: {}  # default model: wake word "Hey Arduino"
 - arduino:tts: {}
+- arduino:weather_forecast: {}
 # To pick a different voice/language, override the TTS model, e.g.:
 # - arduino:tts:
 #     model: melo-tts-en
