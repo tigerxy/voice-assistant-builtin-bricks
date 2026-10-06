@@ -13,9 +13,98 @@ float phase = 0.0;
 float scanPos = 0.0;
 float scanDir = 1.0;
 
+// --- Emotion symbols (13 columns x 8 rows, 'X' = LED on) ---
+// Order must match EMOTIONS in python/main.py
+const int NUM_EMOTIONS = 8;
+const char* const EMOTION_BITMAPS[NUM_EMOTIONS][8] = {
+  { // 0: heart
+    "..XXX...XXX..",
+    ".XXXXX.XXXXX.",
+    ".XXXXXXXXXXX.",
+    "..XXXXXXXXX..",
+    "...XXXXXXX...",
+    "....XXXXX....",
+    ".....XXX.....",
+    "......X......" },
+  { // 1: happy
+    ".............",
+    "...XX...XX...",
+    "...XX...XX...",
+    ".............",
+    ".X.........X.",
+    "..X.......X..",
+    "...XXXXXXX...",
+    "............." },
+  { // 2: sad
+    ".............",
+    "...XX...XX...",
+    "...XX...XX...",
+    ".............",
+    ".............",
+    "...XXXXXXX...",
+    "..X.......X..",
+    ".X.........X." },
+  { // 3: surprised
+    ".............",
+    "...XX...XX...",
+    "...XX...XX...",
+    ".............",
+    ".....XXX.....",
+    "....X...X....",
+    "....X...X....",
+    ".....XXX....." },
+  { // 4: wink
+    ".............",
+    "...XX........",
+    "...XX...XXX..",
+    ".............",
+    ".X.........X.",
+    "..X.......X..",
+    "...XXXXXXX...",
+    "............." },
+  { // 5: angry
+    "..X.......X..",
+    "...X.....X...",
+    "...XX...XX...",
+    ".............",
+    ".............",
+    "...XXXXXXX...",
+    "..X.......X..",
+    "............." },
+  { // 6: confused (question mark)
+    "....XXXXX....",
+    "...XX...XX...",
+    "........XX...",
+    ".......XX....",
+    "......XX.....",
+    "......XX.....",
+    ".............",
+    "......XX....." },
+  { // 7: star
+    "......X......",
+    "......X......",
+    ".....XXX.....",
+    "XXXXXXXXXXXXX",
+    "..XXXXXXXXX..",
+    "...XXXXXXX...",
+    "..XXX...XXX..",
+    ".XX.......XX." }
+};
+int currentEmotion = -1; // -1: none
+float emotionPhase = 0.0;
+
+// RPC: show an emotion symbol (index into EMOTION_BITMAPS, -1 clears it)
+void showEmotion(int emotion) {
+  currentEmotion = (emotion >= 0 && emotion < NUM_EMOTIONS) ? emotion : -1;
+  emotionPhase = 0.0;
+}
+
 // RPC: Receives the command from Python
 void setSystemState(int state) {
   currentState = constrain(state, 0, 3);
+  if (currentState == 0 || currentState == 1) {
+    currentEmotion = -1; // an emotion lasts until the assistant listens again
+  }
   if (currentState == 1) {
     scanPos = 0.0; // Reset scanner when starting to listen
   }
@@ -29,8 +118,26 @@ uint8_t scanBrightness(int col, float headPos, float tailLen) {
   return (uint8_t)(t * t * t * 7.0 + 0.5); // Cubic falloff
 }
 
+// Draws the current emotion with a gentle "heartbeat" pulse
+void renderEmotion() {
+  emotionPhase += 0.15;
+  int bri = 4 + (int)((sin(emotionPhase) * 0.5 + 0.5) * 3.0 + 0.5); // 4..7
+  for (int row = 0; row < 8; row++) {
+    for (int col = 0; col < 13; col++) {
+      logicalFrame[row * 13 + col] = (EMOTION_BITMAPS[currentEmotion][row][col] == 'X') ? bri : 0;
+    }
+  }
+}
+
 void renderMatrix() {
   memset(logicalFrame, 0, sizeof(logicalFrame));
+
+  // --- EMOTION: overrides the thinking/speaking animations while active ---
+  if (currentEmotion >= 0) {
+    renderEmotion();
+    matrix.draw(logicalFrame);
+    return;
+  }
 
   // --- STATE 1 and 2: SCANNER (Listening / Thinking) ---
   if (currentState == 1 || currentState == 2) {
@@ -83,6 +190,7 @@ void setup() {
 
   Bridge.begin();
   Bridge.provide("set_state", setSystemState);
+  Bridge.provide("show_emotion", showEmotion);
 }
 
 void loop() {

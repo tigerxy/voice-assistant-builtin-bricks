@@ -30,9 +30,9 @@ Say **"Hey Arduino"** once, then talk normally:
 The microphone only opens after the assistant has finished speaking, so it
 never hears itself. The trade-off: you can't interrupt it mid-answer.
 
-## Tools: web search and weather
+## Tools: web search, weather and emotions
 
-The local LLM can call two tools when it decides it needs them:
+The local LLM can call three tools when it decides it needs them:
 
 - **`web_search(query)`**: looks things up via the DuckDuckGo Instant Answer API
   and Wikipedia (no API key). There is no web search brick in Arduino's library,
@@ -42,7 +42,14 @@ The local LLM can call two tools when it decides it needs them:
   (open-meteo.com, no API key). It returns a description like "Slight rain",
   not temperatures.
 
-Both need internet access on the board. If your LLM runner doesn't support tool
+- **`show_emotion(emotion)`**: shows a pulsing symbol on the LED matrix while the
+  assistant answers: `heart`, `happy`, `sad`, `surprised`, `wink`, `angry`,
+  `confused` (question mark) or `star`. Ask "Do you like me?" and it answers
+  "Yes, I do!" with a heart. The symbol stays until the assistant listens again.
+  To add a symbol, append a 13×8 bitmap to `EMOTION_BITMAPS` in `sketch.ino`
+  and its name to `EMOTIONS` in `main.py` (same position in both lists).
+
+Web search and weather need internet access on the board. If your LLM runner doesn't support tool
 calling, set `USE_TOOLS = False` in `main.py` and the assistant works offline
 without them.
 
@@ -59,7 +66,7 @@ without them.
 - **Time zone** is a single constant (`TIME_ZONE`) at the top of `main.py`.
 - **Wake word** is now "Hey Arduino": the built-in keyword spotting model
   only knows that phrase (the original used a custom Edge Impulse model for "Ventuno").
-- The MCU sketch (LED matrix animations) is unchanged.
+- The MCU sketch keeps the original animations and adds emotion symbols (`show_emotion` RPC).
 
 ## Voice / language
 

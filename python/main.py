@@ -31,6 +31,10 @@ EXIT_PHRASES = ("stop", "goodbye", "bye", "that's all", "that is all", "thank yo
 # Bridge states understood by sketch.ino
 IDLE, LISTENING, PROCESSING, SPEAKING = 0, 1, 2, 3
 
+# Emotion symbols on the LED matrix. Order must match EMOTION_BITMAPS in sketch.ino
+EMOTIONS = ["heart", "happy", "sad", "surprised", "wink", "angry", "confused", "star"]
+EMOTION_HOLD_SECONDS = 2.0  # keep the symbol visible a moment after speaking
+
 SENTENCE_END = re.compile(r"(?<=[.!?])\s+")
 
 SYSTEM_PROMPT = (
@@ -40,7 +44,10 @@ SYSTEM_PROMPT = (
     "The conversation continues after your answer, so you may ask a short follow-up question when it helps. "
     "Use the web_search tool when you need facts you are not sure about, details about people, places or things, "
     "or anything that may have changed recently. Use the get_weather tool for weather questions. "
-    "Do not use tools for small talk or things you already know well."
+    "Do not use web_search or get_weather for small talk or things you already know well. "
+    "When your answer has a clear feeling, call show_emotion once to show a matching symbol on your LED face, "
+    "for example heart for affection or love, happy for joy, sad for bad news, surprised for amazing facts, "
+    "wink for jokes, confused when you don't understand, star for praise or success. Never mention the symbol in your answer."
 )
 
 # ---------------------------------------------------------------------------
@@ -124,6 +131,28 @@ def get_weather(city: str, days_ahead: int = 0) -> str:
         return f"Weather lookup failed: {e}"
 
 
+emotion_shown = False
+
+
+def show_emotion(emotion: str) -> str:
+    """Show an emotion symbol on the assistant's LED matrix face while it answers.
+
+    Args:
+        emotion: One of "heart", "happy", "sad", "surprised", "wink", "angry", "confused", "star".
+
+    Returns:
+        Confirmation that the symbol is shown.
+    """
+    global emotion_shown
+    name = emotion.strip().lower()
+    if name not in EMOTIONS:
+        return f"Unknown emotion '{emotion}'. Use one of: {', '.join(EMOTIONS)}."
+    print(f"\n😀 Showing emotion: {name}")
+    Bridge.call("show_emotion", EMOTIONS.index(name))
+    emotion_shown = True
+    return f"The {name} symbol is now shown. Now give your spoken answer."
+
+
 # ---------------------------------------------------------------------------
 # Bricks
 # ---------------------------------------------------------------------------
@@ -133,7 +162,7 @@ print("=" * 50)
 
 llm = LargeLanguageModel(
     system_prompt=SYSTEM_PROMPT,
-    tools=[web_search, get_weather] if USE_TOOLS else None,
+    tools=[web_search, get_weather, show_emotion] if USE_TOOLS else None,
 )
 llm.with_memory(MEMORY_MESSAGES)
 
@@ -237,6 +266,8 @@ def wants_to_stop(text):
 
 def think_and_speak(command):
     """Stream the LLM reply (with tool calls if needed) and speak it sentence by sentence."""
+    global emotion_shown
+    emotion_shown = False
     local_time = datetime.now(TIME_ZONE).strftime("%I:%M %p, %A, %B %d, %Y")
     prompt = f"[System info: The current local time and date is {local_time}]\n\nUser: {command}"
 
@@ -268,7 +299,7 @@ def think_and_speak(command):
     # Wait until everything is spoken, so the microphone doesn't hear the assistant itself
     while tts.is_speaking():
         time.sleep(0.1)
-    time.sleep(0.3)
+    time.sleep(EMOTION_HOLD_SECONDS if emotion_shown else 0.3)
 
 
 def loop():
