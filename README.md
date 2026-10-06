@@ -7,7 +7,7 @@ that drops the custom Kokoro brick and uses only Arduino App Lab's built-in bric
 
 | Stage | Brick | Python class |
 |---|---|---|
-| Wake word ("Ventuno") | `arduino:keyword_spotting` | `KeywordSpotting` |
+| Wake word ("Hey Arduino") | `arduino:keyword_spotting` | `KeywordSpotting` |
 | Speech-to-text | `arduino:asr` | `AutomaticSpeechRecognition` |
 | Local LLM (NPU) | `arduino:llm` | `LargeLanguageModel` |
 | Text-to-speech | `arduino:tts` | `TextToSpeech` |
@@ -24,6 +24,8 @@ No `bricks/` folder, no custom code to maintain.
   talking before the LLM has finished generating.
 - **Clean shutdown**: `tts.cancel()` on errors, `tts.stop()` on exit.
 - **Time zone** is a single constant (`TIME_ZONE`) at the top of `main.py`.
+- **Wake word** is now "Hey Arduino": the built-in keyword spotting model
+  only knows that phrase (the original used a custom Edge Impulse model for "Ventuno").
 - The MCU sketch (LED matrix animations) is unchanged.
 
 ## Voice / language

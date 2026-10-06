@@ -65,19 +65,20 @@ user_text = ""
 def on_keyword_detected():
     global app_state
     if app_state == "IDLE":
-        print("\n✨ Wake word 'VENTUNO' detected!")
+        print("\n✨ Wake word 'Hey Arduino' detected!")
         app_state = "LISTENING"
 
 
 spotter = KeywordSpotting(mic=mic_spotter, confidence=0.90, debounce_sec=2.0)
-spotter.on_detect("Ventuno", on_keyword_detected)
+# The built-in keyword spotting model only knows "hey_arduino"
+spotter.on_detect("hey_arduino", on_keyword_detected)
 
 mic_spotter.start()
 asr.start()
 spotter.start()
 
 Bridge.call("set_state", IDLE)
-print("\n✅ All systems online! 💤 Listening for 'Ventuno'...")
+print("\n✅ All systems online! 💤 Listening for 'Hey Arduino'...")
 
 
 def go_idle(message):

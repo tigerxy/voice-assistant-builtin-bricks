@@ -4,8 +4,7 @@ ports: []
 bricks:
 - arduino:llm: {}
 - arduino:asr: {}
-- arduino:keyword_spotting:
-    model: ei-model-985298-1
+- arduino:keyword_spotting: {}  # default model: wake word "Hey Arduino"
 - arduino:tts: {}
 # To pick a different voice/language, override the TTS model, e.g.:
 # - arduino:tts:
