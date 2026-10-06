@@ -12,6 +12,7 @@ that drops the custom Kokoro brick and uses only Arduino App Lab's built-in bric
 | Local LLM (NPU) | `arduino:llm` | `LargeLanguageModel` |
 | Text-to-speech | `arduino:tts` | `TextToSpeech` |
 | Weather (LLM tool) | `arduino:weather_forecast` | `WeatherForecast` |
+| Sound effects | `arduino:sound_generator` | `SoundGenerator` |
 
 No `bricks/` folder, no custom code to maintain.
 
@@ -29,6 +30,25 @@ Say **"Hey Arduino"** once, then talk normally:
 
 The microphone only opens after the assistant has finished speaking, so it
 never hears itself. The trade-off: you can't interrupt it mid-answer.
+
+## Human touches
+
+- **Sound effects**: a rising chime when it wakes up, a falling one when the
+  conversation ends, a short jingle with every emotion symbol and a buzz on errors
+  (`sound_generator` brick, shares the speaker with TTS). Turn off with `SOUND_EFFECTS = False`.
+- **Filler words**: "Let me look that up." before a web search, "Let me check the
+  weather." before a forecast, and "Hmm, let me think." when the first words take
+  longer than `THINKING_FILLER_SECONDS`.
+- **Natural reactions**: instant replies to "thanks" and "hello" (time-aware:
+  "Good morning!", "You're up late!") without waiting for the LLM, varied
+  farewells ("Good night, sleep well!"), "Sorry, I didn't catch that" when it
+  wakes but hears nothing, and a spoken apology instead of silence on errors.
+  The system prompt also asks for varied, warm phrasing.
+- **Idle life**: while waiting, the LED matrix shows dim eyes that blink and look
+  around. At night (`SLEEP_HOURS`) it shows closed eyes with a floating "z".
+  Set `IDLE_FACE` to `"awake"` or `"off"` to change that.
+
+All texts, sounds and timings are constants at the top of `python/main.py`.
 
 ## Tools: web search, weather and emotions
 
@@ -66,7 +86,7 @@ without them.
 - **Time zone** is a single constant (`TIME_ZONE`) at the top of `main.py`.
 - **Wake word** is now "Hey Arduino": the built-in keyword spotting model
   only knows that phrase (the original used a custom Edge Impulse model for "Ventuno").
-- The MCU sketch keeps the original animations and adds emotion symbols (`show_emotion` RPC).
+- The MCU sketch keeps the original animations and adds emotion symbols (`show_emotion` RPC) and an idle face (`set_idle_mode` RPC).
 
 ## Voice / language
 

@@ -110,6 +110,70 @@ void setSystemState(int state) {
   }
 }
 
+// --- Idle face ---
+// 0: awake (blinking, looking around), 1: sleeping (closed eyes, floating "z"), 2: off
+int idleMode = 0;
+unsigned long nextBlink = 0, blinkEnd = 0, nextLook = 0, zStart = 0;
+int lookDir = 0; // -1 left, 0 center, 1 right
+
+// RPC: set how the face looks while idle
+void setIdleMode(int mode) {
+  idleMode = constrain(mode, 0, 2);
+}
+
+void setPixel(int row, int col, int bri) {
+  if (row >= 0 && row < 8 && col >= 0 && col < 13) logicalFrame[row * 13 + col] = bri;
+}
+
+// Two 3x4 eyes at columns 2-4 and 8-10 with a dark pupil that wanders
+void renderIdleAwake() {
+  unsigned long now = millis();
+  if (now >= nextBlink) {
+    blinkEnd = now + 140;
+    // sometimes a quick double blink
+    nextBlink = now + (random(5) == 0 ? 320 : random(2500, 6500));
+  }
+  if (now >= nextLook) {
+    lookDir = random(-1, 2);
+    nextLook = now + random(1500, 5000);
+  }
+  bool blinking = now < blinkEnd;
+
+  const int eyeCols[2] = {2, 8};
+  for (int e = 0; e < 2; e++) {
+    int base = eyeCols[e];
+    for (int c = 0; c < 3; c++) {
+      if (blinking) {
+        setPixel(4, base + c, 2);
+      } else {
+        for (int r = 2; r <= 5; r++) setPixel(r, base + c, 3);
+      }
+    }
+    if (!blinking) {
+      setPixel(3, base + 1 + lookDir, 0);
+      setPixel(4, base + 1 + lookDir, 0);
+    }
+  }
+}
+
+// Closed eyes and a small "z" drifting up
+void renderIdleSleeping() {
+  unsigned long now = millis();
+  for (int c = 0; c < 3; c++) {
+    setPixel(5, 2 + c, 1);
+    setPixel(5, 8 + c, 1);
+  }
+  if (zStart == 0) zStart = now;
+  unsigned long t = (now - zStart) % 4000; // one "z" every 4 s
+  if (t < 3000) {
+    int y = 1 - (int)(t / 1000); // top row 1 -> -1 (drifts off the top)
+    const char* z[4] = {"XXXX", "..X.", ".X..", "XXXX"};
+    for (int r = 0; r < 4; r++)
+      for (int c = 0; c < 4; c++)
+        if (z[r][c] == 'X') setPixel(y + r, 9 + c, 2);
+  }
+}
+
 // Calculates soft brightness (grayscale) for the scanner tail
 uint8_t scanBrightness(int col, float headPos, float tailLen) {
   float dist = fabs((float)col - headPos);
@@ -182,6 +246,13 @@ void renderMatrix() {
   matrix.draw(logicalFrame);
 }
 
+void renderIdle() {
+  memset(logicalFrame, 0, sizeof(logicalFrame));
+  if (idleMode == 0) renderIdleAwake();
+  else if (idleMode == 1) renderIdleSleeping();
+  matrix.draw(logicalFrame);
+}
+
 void setup() {
   delay(1000);
   matrix.begin();
@@ -191,13 +262,17 @@ void setup() {
   Bridge.begin();
   Bridge.provide("set_state", setSystemState);
   Bridge.provide("show_emotion", showEmotion);
+  Bridge.provide("set_idle_mode", setIdleMode);
+  randomSeed(micros());
 }
 
 void loop() {
   if (currentState != 0) {
     renderMatrix();
-  } else {
+  } else if (idleMode == 2) {
     matrix.clear();
+  } else {
+    renderIdle();
   }
   delay(30); // ~33 FPS
 }

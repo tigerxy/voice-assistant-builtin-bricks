@@ -7,6 +7,7 @@ bricks:
 - arduino:keyword_spotting: {}  # default model: wake word "Hey Arduino"
 - arduino:tts: {}
 - arduino:weather_forecast: {}
+- arduino:sound_generator: {}
 # To pick a different voice/language, override the TTS model, e.g.:
 # - arduino:tts:
 #     model: melo-tts-en
