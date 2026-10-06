@@ -45,7 +45,8 @@ never hears itself. The trade-off: you can't interrupt it mid-answer.
   wakes but hears nothing, and a spoken apology instead of silence on errors.
   The system prompt also asks for varied, warm phrasing.
 - **Idle life**: while waiting, the LED matrix shows dim eyes that blink and look
-  around. At night (`SLEEP_HOURS`) it shows closed eyes with a floating "z".
+  around. After 5 minutes without a conversation (`SLEEP_AFTER_SECONDS`) it falls
+  asleep: closed eyes with a floating "z". "Hey Arduino" wakes it up again.
   Set `IDLE_FACE` to `"awake"` or `"off"` to change that.
 
 All texts, sounds and timings are constants at the top of `python/main.py`.

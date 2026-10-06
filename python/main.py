@@ -30,8 +30,9 @@ SEARCH_LANG = "en"         # Wikipedia language edition used by web_search
 SOUND_EFFECTS = True       # short chimes and jingles via the sound_generator brick
 SOUND_VOLUME = 0.35        # 0.0 .. 1.0
 THINKING_FILLER_SECONDS = 3.0  # say "hmm..." if the first words take longer than this
-IDLE_FACE = "auto"         # "auto" (awake by day, sleeping at night), "awake" or "off"
-SLEEP_HOURS = (22, 7)      # night time for the sleeping face: from 22:00 to 07:00
+IDLE_FACE = "auto"         # "auto" (falls asleep after inactivity), "awake" or "off"
+SLEEP_AFTER_SECONDS = 5 * 60  # show the sleeping face after this long without a conversation
+NIGHT_HOURS = (22, 7)      # used for wording only, e.g. "Good night!" from 22:00 to 07:00
 
 # Saying one of these ends the conversation
 EXIT_PHRASES = ("stop", "goodbye", "bye", "that's all", "that is all", "thank you, that's it", "never mind")
@@ -109,7 +110,7 @@ def part_of_day(hour=None):
 
 def is_night(hour=None):
     hour = now_local().hour if hour is None else hour
-    start, end = SLEEP_HOURS
+    start, end = NIGHT_HOURS
     return hour >= start or hour < end
 
 
@@ -335,27 +336,25 @@ asr.start()
 spotter.start()
 
 current_idle_mode = None
-next_idle_check = 0.0
+last_activity = time.monotonic()  # end of the last conversation (or app start)
 
 
-def update_idle_face(force=False):
-    """Awake eyes by day, sleeping face at night (checked every 30 s while idle)."""
-    global current_idle_mode, next_idle_check
-    if not force and time.monotonic() < next_idle_check:
-        return
-    next_idle_check = time.monotonic() + 30
+def update_idle_face():
+    """Awake eyes after a conversation, sleeping face after SLEEP_AFTER_SECONDS of inactivity."""
+    global current_idle_mode
     if IDLE_FACE == "off":
         mode = IDLE_OFF
     elif IDLE_FACE == "awake":
         mode = IDLE_AWAKE
     else:
-        mode = IDLE_SLEEPING if is_night() else IDLE_AWAKE
+        idle_for = time.monotonic() - last_activity
+        mode = IDLE_SLEEPING if idle_for >= SLEEP_AFTER_SECONDS else IDLE_AWAKE
     if mode != current_idle_mode:
         Bridge.call("set_idle_mode", mode)
         current_idle_mode = mode
 
 
-update_idle_face(force=True)
+update_idle_face()
 Bridge.call("set_state", IDLE)
 print("\n✅ All systems online! 💤 Listening for 'Hey Arduino'...")
 
@@ -364,11 +363,13 @@ print("\n✅ All systems online! 💤 Listening for 'Hey Arduino'...")
 # Conversation
 # ---------------------------------------------------------------------------
 def end_conversation(message, sound="end"):
-    global app_state
+    global app_state, last_activity
     print(message)
     if sound:
         play_earcon(sound, block=True)
     llm.clear_memory()  # the next "Hey Arduino" starts a fresh conversation
+    last_activity = time.monotonic()  # wide awake again; the sleep countdown restarts
+    update_idle_face()
     Bridge.call("set_state", IDLE)
     app_state = "IDLE"
     print("💤 Listening for 'Hey Arduino'...")
