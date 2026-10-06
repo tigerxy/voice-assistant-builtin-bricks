@@ -60,4 +60,9 @@ sketch/sketch.yaml
 
 ## License
 
-Derived from a GPL-3.0 project, so this version is GPL-3.0 as well.
+This project is licensed under the [GNU General Public License v3.0](LICENSE).
+
+It is derived from [keyword-asr-local-llm-kokoro-tts](https://github.com/mcmchris/keyword-asr-local-llm-kokoro-tts)
+by [mcmchris](https://github.com/mcmchris), which is also licensed under GPL-3.0.
+The MCU sketch (`sketch/sketch.ino`) and the overall application structure come from
+that project; the Python backend was adapted to use only Arduino's built-in bricks.
