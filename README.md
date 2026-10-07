@@ -53,9 +53,9 @@ The trade-off: you can't interrupt it mid-answer.
 
 All texts, sounds and timings are constants at the top of `python/main.py`.
 
-## Actions: web search, weather and emotions
+## Tools: web search, weather and emotions
 
-The local LLM can use three actions when it decides it needs them:
+The local LLM can use three tools when it decides it needs them:
 
 - **`web_search("query")`**: looks things up via the DuckDuckGo Instant Answer API
   and Wikipedia (no API key). There is no web search brick in Arduino's library,
@@ -71,14 +71,15 @@ The local LLM can use three actions when it decides it needs them:
   To add a symbol, append a 13×8 bitmap to `EMOTION_BITMAPS` in `sketch.ino`
   and its name to `EMOTIONS` in `main.py` (same position in both lists).
 
-**How it works:** the model runner on the VENTUNO Q doesn't return real
-(structured) tool calls. The model writes them into its answer as text, in
-different styles (`show_emotion("heart")`, `Show_emotion(heart)`, a
-`{"tool_calls": [...]}` JSON block or `<tool_call>` tags). So the system
-prompt describes the actions, and `main.py` finds them in the streamed answer,
-carries them out and never reads them aloud. After `web_search` or
-`get_weather` the result goes back to the model, which then answers
-(at most `MAX_LOOKUP_ROUNDS` lookups per question).
+**How it works:** the three functions are registered with the LLM brick
+(`LargeLanguageModel(system_prompt=..., tools=TOOLS)`). When the model returns a
+real tool call, the brick runs the function and the model continues its answer
+with the result. The small model on the VENTUNO Q often writes the call into its
+answer as text instead (`show_emotion("heart")`, `Show_emotion(heart)`, a
+`{"tool_calls": [...]}` JSON block or `<tool_call>` tags), which the brick can't
+run. So `main.py` also finds those in the streamed answer, carries them out and
+never reads them aloud; for a lookup written as text, the result is sent back to
+the model in a second round (at most `MAX_LOOKUP_ROUNDS` per question).
 
 Web search and weather need internet access on the board. Set
 `USE_TOOLS = False` in `main.py` to turn all actions off.

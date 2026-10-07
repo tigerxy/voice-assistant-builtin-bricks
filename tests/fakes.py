@@ -25,6 +25,7 @@ Events are tuples:
     ("weather", city, kwargs)      WeatherForecast lookup
 """
 
+import inspect
 import sys
 import threading
 import types
@@ -92,9 +93,20 @@ class _App:
 class LargeLanguageModel:
     last = None
 
-    def __init__(self, system_prompt="", tools=None, **kwargs):
+    def __init__(self, system_prompt: str = "", temperature=0.7, max_tokens: int = 512,
+                 timeout=None, tools=None, model=None):
+        # Same parameters as the real brick (no **kwargs: unknown arguments fail here too)
         self.system_prompt = system_prompt
-        self.tools = {t.__name__: t for t in (tools or [])}
+        self.tools = {}
+        for tool in tools or []:
+            # Like the real brick, plain functions are wrapped with
+            # StructuredTool.from_function, which needs a docstring and type hints.
+            if not callable(tool):
+                raise TypeError(f"{tool!r} is not a tool")
+            hints = inspect.signature(tool).parameters
+            if not tool.__doc__ or any(p.annotation is inspect.Parameter.empty for p in hints.values()):
+                raise ValueError(f"tool {tool.__name__} needs a docstring and type hints")
+            self.tools[tool.__name__] = tool
         self.memory = None
         LargeLanguageModel.last = self
 

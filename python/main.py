@@ -90,19 +90,17 @@ SYSTEM_PROMPT = (
     "The conversation continues after your answer, so you may ask a short follow-up question when it helps."
 )
 
-ACTIONS_PROMPT = (
-    "\n\nYou can use three actions. To use one, write it exactly like this on its own line:\n"
-    'web_search("short search query")  - look up facts you are not sure about: people, places, things, '
-    "or anything that may have changed recently.\n"
-    'get_weather("City", 0)  - weather forecast. The number is days ahead: 0 today, 1 tomorrow, up to 6.\n'
-    'show_emotion("heart")  - show a symbol on your LED face: heart, happy, sad, surprised, wink, angry, '
-    "confused or star.\n"
-    "When you need web_search or get_weather, write only that line and stop: you will get the result, then answer. "
-    "Use show_emotion at most once, at the start of an answer with a clear feeling, for example heart for "
-    "affection, wink for jokes, sad for bad news. Don't use actions for small talk or things you know well."
+TOOLS_PROMPT = (
+    "\n\nYou have three tools. "
+    "Use web_search to look up facts you are not sure about: people, places, things, or anything that may "
+    "have changed recently. Use get_weather for weather questions. You get their result before you answer. "
+    "Use show_emotion at most once per answer, when it has a clear feeling, to show a symbol on your LED face: "
+    "heart for affection, happy for joy, sad for bad news, surprised for amazing facts, wink for jokes, "
+    "confused when you don't understand, star for praise. Never mention the symbol or the tools in your answer. "
+    "Don't use tools for small talk or things you know well."
 )
 if USE_TOOLS:
-    SYSTEM_PROMPT += ACTIONS_PROMPT
+    SYSTEM_PROMPT += TOOLS_PROMPT
 
 # ---------------------------------------------------------------------------
 # Small human touches: time of day, fillers, sounds
@@ -278,6 +276,8 @@ def web_search(query: str) -> str:
         Text snippets from the search results.
     """
     print(f"\n🔎 Searching the web for: {query}")
+    if not turn_has_spoken.is_set():
+        say_filler(SEARCH_FILLERS)
     found = []
     for source in (_duckduckgo, _wikipedia):
         try:
@@ -306,6 +306,8 @@ def get_weather(city: str, days_ahead: int = 0) -> str:
     except (TypeError, ValueError):
         days_ahead = 0
     print(f"\n🌦️ Getting weather for {city} (+{days_ahead} days)")
+    if not turn_has_spoken.is_set():
+        say_filler(WEATHER_FILLERS)
     try:
         data = _weather.get_forecast_by_city(city, timezone=str(TIME_ZONE), forecast_days=days_ahead + 1)
         return f"Weather in {city}: {data.description} ({data.category})."
@@ -341,15 +343,22 @@ def show_emotion(emotion: str) -> str:
     return f"The {name} symbol is now shown. Now give your spoken answer."
 
 
+# The tools handed to the LLM brick (tools=...). Plain functions are fine: the brick
+# wraps each one into a LangChain tool, using its name, type hints and docstring.
+TOOLS = [web_search, get_weather, show_emotion]
+
+
 # ---------------------------------------------------------------------------
-# Actions the LLM writes into its answer
+# Fallback: tool calls the LLM writes into its answer as text
 # ---------------------------------------------------------------------------
-# The local model on the board does not return real (structured) tool calls: it
-# writes them into its answer as text, in different styles, for example
+# The tools are registered with the LLM brick, which runs them when the model returns
+# a real (structured) tool call. But the local model on the board often writes the
+# call into its answer as plain text instead, in different styles, for example
 #   show_emotion("heart")      Show_emotion(heart)
 #   {"tool_calls": [{"type": "function", "function": {"name": "get_weather", "arguments": {...}}}]}
 #   <tool_call>{"name": "web_search", "arguments": {"query": "..."}}</tool_call>
-# So the answer is scanned for these: they are carried out and never read aloud.
+# The brick can't run those, so the answer is also scanned for them: they are carried
+# out here and never read aloud.
 ACTION_NAMES = ("web_search", "get_weather", "show_emotion")
 LOOKUP_ACTIONS = ("web_search", "get_weather")
 CALL_RE = re.compile(r"\b(web_search|get_weather|show_emotion)\s*\(([^()]*)\)", re.I)
@@ -492,9 +501,7 @@ def _arg(args, *names, default=""):
 
 
 def run_lookups(lookups):
-    """Carry out web_search / get_weather and return the results as the next message for the LLM."""
-    if not turn_has_spoken.is_set():
-        say_filler(SEARCH_FILLERS if lookups[0][0] == "web_search" else WEATHER_FILLERS)
+    """Carry out web_search / get_weather written as text; return the results as the next message."""
     results = []
     for name, args in lookups[:3]:
         if name == "web_search":
@@ -518,8 +525,10 @@ print("=" * 50)
 print("🚀 PHASE 1: Loading LOCAL LLM into RAM...")
 print("=" * 50)
 
-# No tools= here: the runner on the board doesn't return real tool calls (see "Actions" above)
-llm = LargeLanguageModel(system_prompt=SYSTEM_PROMPT)
+llm = LargeLanguageModel(
+    system_prompt=SYSTEM_PROMPT,
+    tools=TOOLS if USE_TOOLS else None,
+)
 llm.with_memory(MEMORY_MESSAGES)
 
 try:

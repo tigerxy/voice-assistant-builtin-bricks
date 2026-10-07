@@ -370,17 +370,43 @@ class TestFillerWords(AssistantTestCase):
 
 
 class TestTools(AssistantTestCase):
-    def test_no_structured_tools_are_bound(self):
-        # The runner on the board doesn't return real tool calls; actions are parsed from the text.
-        self.assertEqual(fakes.LargeLanguageModel.last.tools, {})
+    def test_tools_are_registered_with_the_llm(self):
+        tools = fakes.LargeLanguageModel.last.tools
+        self.assertEqual(set(tools), {"web_search", "get_weather", "show_emotion"})
+        self.assertIs(tools["web_search"], self.m.web_search)
+
+    def test_no_tools_registered_when_switched_off(self):
+        main = MAIN.read_text()
+        self.assertIn("tools=TOOLS if USE_TOOLS else None", main)
+
+    def test_structured_tool_calls_run_through_the_brick(self):
+        # When the runner returns a real tool call, the brick runs the function and then
+        # streams the rest of the answer. Simulated here by calling the registered tool.
+        self.w.http_routes = {"https://api.duckduckgo.com/": {"AbstractText": "Mount Everest is 8849 m high."}}
+
+        def brick_with_tool_calls(prompt, tools):
+            tools["show_emotion"]("surprised")
+            result = tools["web_search"]("Mount Everest height")
+            assert "8849" in result
+            yield "Wow, it's about eight thousand eight hundred meters high!"
+
+        self.w.llm_responder = brick_with_tool_calls
+        self.say("How high is Mount Everest?", "")
+        self.wake()
+        self.run_until_idle()
+        spoken = self.w.spoken()
+        self.assertIn(spoken[0], self.m.SEARCH_FILLERS)
+        self.assertEqual(spoken[1], "Wow, it's about eight thousand eight hundred meters high!")
+        self.assertIn(("bridge", "show_emotion", self.m.EMOTIONS.index("surprised")), self.w.events)
+        self.assertEqual(len(self.w.of("llm")), 1, "no extra round needed for a structured call")
 
     def test_tools_have_docstrings_for_the_llm(self):
         for tool in (self.m.web_search, self.m.get_weather, self.m.show_emotion):
             self.assertTrue(tool.__doc__ and "Args:" in tool.__doc__, tool.__name__)
 
     def test_system_prompt_mentions_every_tool(self):
-        for example in ('web_search("', 'get_weather("', 'show_emotion("'):
-            self.assertIn(example, self.m.SYSTEM_PROMPT)
+        for name in ("web_search", "get_weather", "show_emotion"):
+            self.assertIn(name, self.m.SYSTEM_PROMPT)
 
     def test_actions_can_be_switched_off(self):
         self.m.USE_TOOLS = False
