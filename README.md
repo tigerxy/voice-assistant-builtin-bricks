@@ -28,8 +28,10 @@ Say **"Hey Arduino"** once, then talk normally:
    "that's all" or "never mind". The history is then cleared, so the next
    "Hey Arduino" starts fresh.
 
-The microphone only opens after the assistant has finished speaking, so it
-never hears itself. The trade-off: you can't interrupt it mid-answer.
+The speech recognition microphone only opens after the assistant has finished
+speaking, so it never hears itself. The wake word detector reads its own stream
+of the same microphone (ALSA shared mode) and keeps running the whole time.
+The trade-off: you can't interrupt it mid-answer.
 
 ## Human touches
 
@@ -79,11 +81,13 @@ without them.
 - **TTS**: `TextToSpeech` from `arduino.app_bricks.tts` replaces `KokoroTTS`.
   It plays directly through a `Speaker` peripheral, so the temporary `.wav`
   file and the `aplay` shell call are gone.
-- **Lower latency**: the LLM reply is streamed and each finished sentence is
-  queued with `tts.speak(sentence, block=False)`, so the assistant starts
-  talking before the LLM has finished generating.
+- **Lower latency**: the LLM reply is streamed and each finished sentence goes
+  into a small speech queue (`Voice` in `main.py`), so the assistant starts
+  talking before the LLM has finished generating. The queue only uses
+  `TextToSpeech.speak(text)`, so it works with older brick libraries too
+  (0.11/0.12 have no background speech of their own).
 - **Real conversations** with follow-up questions, plus web search and weather tools (see above).
-- **Clean shutdown**: `tts.cancel()` on errors, `tts.stop()` on exit.
+- **Clean errors**: speech is cancelled and the assistant apologizes instead of going silent.
 - **Time zone** is a single constant (`TIME_ZONE`) at the top of `main.py`.
 - **Wake word** is now "Hey Arduino": the built-in keyword spotting model
   only knows that phrase (the original used a custom Edge Impulse model for "Ventuno").

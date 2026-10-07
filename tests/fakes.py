@@ -1,15 +1,23 @@
 """Fake versions of the Arduino App Lab bricks (and `requests`) used by python/main.py.
 
-They let the app run on any computer without the VENTUNO Q hardware. Every fake
+They let the app run on any computer without the VENTUNO Q hardware.
+
+The method signatures copy the brick library that runs on the board
+(arduino_app_bricks 0.11/0.12), not the newest version on GitHub. For example
+TextToSpeech.speak(text) has no `block` argument there, so calling it with one
+fails here just like on the board.
+
+Every fake
 writes what happens into one shared, ordered event log, so tests can check both
 *what* the assistant did and *in which order* (e.g. "chime before listening").
 
 Events are tuples:
     ("bridge", rpc_name, arg)      Bridge.call to the MCU sketch
-    ("speak", text, block)         TextToSpeech.speak
+    ("speak", text)                TextToSpeech.speak (blocks while "speaking")
+    ("tts_busy", text)             speak() called while another speak() was still running
     ("tone", note)                 SoundGenerator.play_tone
-    ("listen", seconds, mic_on, kws_on)  ASR started; was the mic on / the wake word detector running?
-    ("mic", "start" | "stop")      Microphone started or stopped
+    ("listen", seconds, mic_on)    ASR started; was its microphone on?
+    ("mic", "start" | "stop", owner)  a Microphone started/stopped; owner is "asr" or "kws"
     ("app", "start_brick" | "stop_brick", brick_class_name)
     ("llm", prompt)                LLM chat_stream called
     ("clear_memory",)              LLM memory cleared
@@ -115,8 +123,9 @@ class _Chunk:
 
 
 class AutomaticSpeechRecognition:
-    def __init__(self, mic=None):
-        self.mic = mic
+    def __init__(self, mic=None, language=None):
+        self.mic = mic if mic is not None else Microphone()
+        self.mic.owner = "asr"
 
     def start(self):
         pass
@@ -126,8 +135,7 @@ class AutomaticSpeechRecognition:
 
     @contextmanager
     def transcribe_stream(self, duration=7):
-        kws_on = any(k.running for k in KeywordSpotting.instances)
-        world.log("listen", duration, bool(self.mic and self.mic.started), kws_on)
+        world.log("listen", duration, self.mic.started)
         text = world.utterances.pop(0) if world.utterances else ""
         chunks = []
         if text:
@@ -139,9 +147,11 @@ class AutomaticSpeechRecognition:
 class KeywordSpotting:
     instances = []
 
-    def __init__(self, mic=None, confidence=0.8, debounce_sec=1.0):
+    def __init__(self, mic=None, confidence=0.8, debounce_sec=2.0):
         self.confidence = confidence
-        self.mic = mic
+        # Like the real brick: without a mic it opens its own stream (model's sample rate)
+        self.mic = mic if mic is not None else Microphone(0, sample_rate=16000, channels=1)
+        self.mic.owner = "kws"
         self.running = False
         KeywordSpotting.instances.append(self)
 
@@ -150,19 +160,27 @@ class KeywordSpotting:
 
     def start(self):
         self.running = True
-        if self.mic:
-            self.mic.start()
+        self.mic.start()
 
     def stop(self):
         self.running = False
-        if self.mic:
-            self.mic.stop()
+        self.mic.stop()
 
 
 # --- arduino.app_bricks.tts ---------------------------------------------------
+class TTSBusyError(Exception):
+    pass
+
+
 class TextToSpeech:
-    def __init__(self, speaker=None, max_queue_size=128):
-        pass
+    """Same API as the TTS brick in arduino_app_bricks 0.11/0.12 (on the board):
+    speak(text) blocks until spoken and refuses to run twice at the same time.
+    There is no speak(block=...) and no is_speaking()."""
+
+    SPEAK_SECONDS = 0.01
+
+    def __init__(self, speaker=None):
+        self._session = threading.Lock()
 
     def start(self):
         pass
@@ -170,11 +188,15 @@ class TextToSpeech:
     def stop(self):
         pass
 
-    def speak(self, text, block=True):
-        world.log("speak", text, block)
-
-    def is_speaking(self):
-        return False
+    def speak(self, text: str):
+        if not self._session.acquire(blocking=False):
+            world.log("tts_busy", text)
+            raise TTSBusyError("A speech session is already active on this instance.")
+        try:
+            world.log("speak", text)
+            wait(self.SPEAK_SECONDS)
+        finally:
+            self._session.release()
 
     def cancel(self):
         world.log("tts_cancel")
@@ -220,17 +242,18 @@ class Microphone:
 
     def __init__(self, *args, **kwargs):
         self.started = False
+        self.owner = None
         Microphone.instances.append(self)
 
     def start(self):
         if not self.started:  # like the real one: starting twice is a no-op
             self.started = True
-            world.log("mic", "start")
+            world.log("mic", "start", self.owner)
 
     def stop(self):
         if self.started:
             self.started = False
-            world.log("mic", "stop")
+            world.log("mic", "stop", self.owner)
 
 
 # --- requests (only what main.py uses) --------------------------------------------
@@ -284,7 +307,7 @@ def install():
     module("arduino.app_bricks.llm", LargeLanguageModel=LargeLanguageModel)
     module("arduino.app_bricks.asr", AutomaticSpeechRecognition=AutomaticSpeechRecognition)
     module("arduino.app_bricks.keyword_spotting", KeywordSpotting=KeywordSpotting)
-    module("arduino.app_bricks.tts", TextToSpeech=TextToSpeech)
+    module("arduino.app_bricks.tts", TextToSpeech=TextToSpeech, TTSBusyError=TTSBusyError)
     module("arduino.app_bricks.weather_forecast", WeatherForecast=WeatherForecast)
     module("arduino.app_bricks.sound_generator", SoundGenerator=SoundGenerator, SoundEffect=SoundEffect)
     module("arduino.app_peripherals")

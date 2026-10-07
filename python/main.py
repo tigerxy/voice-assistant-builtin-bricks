@@ -1,3 +1,4 @@
+import queue
 import random
 import re
 import threading
@@ -153,7 +154,66 @@ def say_filler(options):
     """Say a short filler phrase without blocking (it's queued before the answer)."""
     turn_has_spoken.set()
     Bridge.call("set_state", SPEAKING)
-    tts.speak(random.choice(options), block=False)
+    voice.say(random.choice(options))
+
+
+class Voice:
+    """Speaks queued sentences one after another in a background thread.
+
+    Lets the assistant start talking while the LLM is still generating. Only uses
+    TextToSpeech.speak(text) (blocks until spoken), which every version of the TTS
+    brick has, so it also works with the older library on the board.
+    """
+
+    def __init__(self, tts_brick):
+        self._tts = tts_brick
+        self._queue = queue.Queue()
+        self._pending = 0
+        self._generation = 0  # bumped by stop_talking() to drop queued sentences
+        self._done = threading.Condition()
+        threading.Thread(target=self._worker, name="Voice", daemon=True).start()
+
+    def say(self, text, wait=False):
+        """Queue text to be spoken. With wait=True, return only when everything is spoken."""
+        text = text.strip()
+        if text:
+            with self._done:
+                self._pending += 1
+                generation = self._generation
+            self._queue.put((generation, text))
+        if wait:
+            self.wait()
+
+    def is_busy(self):
+        with self._done:
+            return self._pending > 0
+
+    def wait(self):
+        """Block until everything queued has been spoken."""
+        with self._done:
+            self._done.wait_for(lambda: self._pending == 0)
+
+    def stop_talking(self):
+        """Drop everything still queued and interrupt the current sentence."""
+        with self._done:
+            self._generation += 1
+        try:
+            self._tts.cancel()
+        except Exception as e:
+            print(f"⚠️ Could not cancel speech: {e}")
+
+    def _worker(self):
+        while True:
+            generation, text = self._queue.get()
+            try:
+                if generation == self._generation:
+                    self._tts.speak(text)
+            except Exception as e:
+                print(f"⚠️ Speech failed: {e}")
+            finally:
+                with self._done:
+                    self._pending -= 1
+                    self._done.notify_all()
 
 
 # ---------------------------------------------------------------------------
@@ -296,24 +356,24 @@ print("=" * 50)
 # To force a specific output (the original used ALSA card 1, device 0):
 #   from arduino.app_peripherals.speaker import Speaker
 #   tts = TextToSpeech(speaker=Speaker("plughw:1,0", sample_rate=Speaker.RATE_44K, shared=True))
+# (Bricks are started by App.run() below; starting them here as well would
+# warm up the TTS and ASR models twice and slow down the start.)
 tts = TextToSpeech()
-print("⏳ Warming up TTS...")
-tts.start()  # opens the speaker and pre-loads the TTS model
-print("✅ TTS ready.")
+voice = Voice(tts)
 
 if SOUND_EFFECTS:
     try:
         # Shares the speaker with TTS (both open it in shared mode)
         sfx = SoundGenerator(wave_form="sine", sound_effects=[SoundEffect.adsr()])
-        sfx.start()
-        print("✅ Sound effects ready.")
     except Exception as e:
         print(f"⚠️ Sound effects disabled: {e}")
         sfx = None
 
-# One microphone for both the wake word and speech recognition. They take turns:
-# the wake word detector listens while idle and is paused during a conversation,
-# so the two never read from the microphone at the same time.
+# Microphone for speech recognition. It is only switched on while the assistant
+# listens, so it never records the assistant's own voice.
+# The wake word detector opens its own stream of the same physical microphone
+# (ALSA shared mode). The two must not read from one Microphone object: each
+# read takes the chunk away from the other, so both would get half the audio.
 mic = Microphone()
 asr = AutomaticSpeechRecognition(mic)
 
@@ -329,12 +389,10 @@ def on_keyword_detected():
         app_state = "LISTENING"
 
 
-spotter = KeywordSpotting(mic=mic, confidence=0.90, debounce_sec=2.0)
+spotter = KeywordSpotting(confidence=0.90, debounce_sec=2.0)  # own mic stream, at the model's sample rate
 # The built-in keyword spotting model only knows "hey_arduino"
 spotter.on_detect("hey_arduino", on_keyword_detected)
 
-asr.start()
-spotter.start()  # also starts the microphone
 
 current_idle_mode = None
 last_activity = time.monotonic()  # end of the last conversation (or app start)
@@ -363,16 +421,6 @@ print("\n✅ All systems online! 💤 Listening for 'Hey Arduino'...")
 # ---------------------------------------------------------------------------
 # Conversation
 # ---------------------------------------------------------------------------
-def pause_wake_word():
-    """Stop the wake word detector so speech recognition has the microphone to itself."""
-    App.stop_brick(spotter)  # stops its threads and the microphone
-
-
-def resume_wake_word():
-    """Hand the microphone back to the wake word detector."""
-    App.start_brick(spotter)  # restarts the microphone and its threads
-
-
 def end_conversation(message, sound="end"):
     global app_state, last_activity
     print(message)
@@ -382,7 +430,6 @@ def end_conversation(message, sound="end"):
     last_activity = time.monotonic()  # wide awake again; the sleep countdown restarts
     update_idle_face()
     Bridge.call("set_state", IDLE)
-    resume_wake_word()
     app_state = "IDLE"
     print("💤 Listening for 'Hey Arduino'...")
 
@@ -447,7 +494,7 @@ def think_and_speak(command):
     def speak_sentence(sentence):
         turn_has_spoken.set()
         Bridge.call("set_state", SPEAKING)
-        tts.speak(sentence, block=False)
+        voice.say(sentence)
 
     print("🧠 AI thinking (local): ", end="", flush=True)
     buffer = ""
@@ -471,8 +518,7 @@ def think_and_speak(command):
         speak_sentence(buffer)
 
     # Wait until everything is spoken, so the microphone doesn't hear the assistant itself
-    while tts.is_speaking():
-        time.sleep(0.1)
+    voice.wait()
     time.sleep(EMOTION_HOLD_SECONDS if emotion_shown else 0.3)
 
 
@@ -487,7 +533,6 @@ def loop():
     if app_state in ("LISTENING", "FOLLOW_UP"):
         just_woke = app_state == "LISTENING"
         if just_woke:
-            pause_wake_word()  # the conversation takes over the microphone
             play_earcon("wake", block=True)  # "I'm listening" chime
         user_text = listen(COMMAND_SECONDS if just_woke else FOLLOW_UP_SECONDS)
 
@@ -495,7 +540,7 @@ def loop():
             if just_woke:
                 # Woken up but heard nothing: say so, like a person would
                 Bridge.call("set_state", SPEAKING)
-                tts.speak(random.choice(DIDNT_CATCH))
+                voice.say(random.choice(DIDNT_CATCH), wait=True)
             end_conversation("\n🤷 Nothing heard. Conversation ended.")
             return
         print(f"\n🗣️ You said: {user_text}")
@@ -503,7 +548,7 @@ def loop():
 
         if wants_to_stop(user_text):
             Bridge.call("set_state", SPEAKING)
-            tts.speak(farewell())
+            voice.say(farewell(), wait=True)
             end_conversation("👋 Conversation ended by user.")
             return
 
@@ -513,7 +558,7 @@ def loop():
             print(f"💬 Quick reply: {reply}")
             display_emotion("happy")
             Bridge.call("set_state", SPEAKING)
-            tts.speak(reply)
+            voice.say(reply, wait=True)
             time.sleep(1.0)
             app_state = "FOLLOW_UP"
             return
@@ -535,10 +580,10 @@ def loop():
 def apologize():
     """Tell the user something went wrong instead of silently going back to sleep."""
     try:
-        tts.cancel()
+        voice.stop_talking()
         play_earcon("error", block=True)
         Bridge.call("set_state", SPEAKING)
-        tts.speak(random.choice(ERROR_REPLIES))
+        voice.say(random.choice(ERROR_REPLIES), wait=True)
     except Exception as e:
         print(f"⚠️ Could not apologize: {e}")
 
@@ -548,9 +593,6 @@ try:
 except KeyboardInterrupt:
     print("\nStopping application...")
 finally:
-    tts.stop()
-    if sfx:
-        sfx.stop()
+    voice.stop_talking()
     mic.stop()
-    asr.stop()
     Bridge.call("set_state", IDLE)

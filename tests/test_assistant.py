@@ -95,51 +95,91 @@ class TestWakeWordAndListening(AssistantTestCase):
 
 
 class TestMicrophone(AssistantTestCase):
-    def test_only_one_microphone_is_created(self):
-        self.assertEqual(len(fakes.Microphone.instances), 1)
+    def test_main_creates_one_microphone(self):
+        self.assertEqual(MAIN.read_text().count("Microphone("), 1)
 
-    def test_wake_word_and_speech_recognition_share_it(self):
-        mic = fakes.Microphone.instances[0]
-        self.assertIs(fakes.KeywordSpotting.instances[0].mic, mic)
-        self.assertIs(self.m.asr.mic, mic)
+    def test_wake_word_and_speech_recognition_use_separate_streams(self):
+        # One Microphone object must never be read by two bricks at once:
+        # every read takes the chunk away from the other reader.
+        kws_mic = fakes.KeywordSpotting.instances[0].mic
+        self.assertIsNot(kws_mic, self.m.asr.mic)
+        self.assertIs(self.m.asr.mic, self.m.mic)
 
-    def test_microphone_is_listening_for_the_wake_word_at_start(self):
-        # (The fake App.run() returns at once, so main.py's shutdown code already ran:
-        # check the start-up events instead of the current state.)
-        self.m = load_main()
-        self.w = fakes.world
-        self.assertEqual(self.w.of("mic")[0], ("mic", "start"))
-        self.assertTrue(fakes.KeywordSpotting.instances[0].running)
+    def test_wake_word_detector_is_never_stopped_by_the_app(self):
+        # Stopping it while its reader thread runs crashes that thread on the board
+        # ("Attempted to read from E20 before starting it") and blocks for 5 seconds.
+        self.say("What is two plus two?", "And three plus three?", "")
+        self.wake()
+        self.run_until_idle()
+        self.assertEqual(self.w.of("app"), [])
+        self.assertFalse([e for e in self.w.of("mic") if e[2] == "kws"])
 
-    def test_wake_word_detector_is_paused_whenever_speech_is_recognized(self):
+    def test_speech_recognition_microphone_is_on_while_listening(self):
         self.say("What is two plus two?", "And three plus three?", "")
         self.wake()
         self.run_until_idle()
         listens = self.w.of("listen")
         self.assertEqual(len(listens), 3)
-        for _, _, mic_on, kws_on in listens:
-            self.assertTrue(mic_on, "microphone must be on while recognizing speech")
-            self.assertFalse(kws_on, "wake word detector must not read the microphone at the same time")
-
-    def test_wake_word_detector_resumes_after_the_conversation(self):
-        self.say("Hello there", "")
-        self.wake()
-        self.run_until_idle()
-        self.assertEqual(
-            [e[1] for e in self.w.of("app")], ["stop_brick", "start_brick"],
-            "pause once at the start, resume once at the end",
-        )
-        self.assertTrue(fakes.KeywordSpotting.instances[0].running)
-        self.assertTrue(fakes.Microphone.instances[0].started)
+        self.assertTrue(all(mic_on for _, _, mic_on in listens))
 
     def test_microphone_is_off_while_the_assistant_speaks(self):
         self.say("Tell me something", "")
         self.answer_with("Here you go.")
         self.wake()
         self.run_until_idle()
-        speak = self.w.index(lambda e: e == ("speak", "Here you go.", False))
-        last_mic = [e for e in self.w.events[:speak] if e[0] == "mic"][-1]
-        self.assertEqual(last_mic, ("mic", "stop"))
+        speak = self.w.index(lambda e: e == ("speak", "Here you go."))
+        last_mic = [e for e in self.w.events[:speak] if e[0] == "mic" and e[2] == "asr"][-1]
+        self.assertEqual(last_mic, ("mic", "stop", "asr"))
+
+
+class TestSpeechWithBoardLibrary(AssistantTestCase):
+    """The TTS brick on the board only has a blocking speak(text)."""
+
+    def test_answer_streams_while_llm_is_still_generating(self):
+        def slow_answer(prompt, tools):
+            yield "First sentence."
+            yield " Second"  # the space after the "." shows the first sentence is complete
+            fakes.wait(0.2)
+            spoken_before_llm_finished.extend(self.w.spoken())
+            yield " sentence."
+
+        spoken_before_llm_finished = []
+        self.w.llm_responder = slow_answer
+        self.say("Talk to me", "")
+        self.wake()
+        self.run_until_idle()
+        self.assertEqual(spoken_before_llm_finished, ["First sentence."])
+        self.assertEqual(self.w.spoken()[:2], ["First sentence.", "Second sentence."])
+
+    def test_never_speaks_twice_at_the_same_time(self):
+        self.m.THINKING_FILLER_SECONDS = 0.01
+
+        def slow(prompt, tools):
+            fakes.wait(0.1)
+            tools["web_search"]("anything")
+            yield "One. Two. Three. Four."
+
+        self.w.http_routes = {"https://": ConnectionError("offline")}
+        self.w.llm_responder = slow
+        self.say("Question", "")
+        self.wake()
+        self.run_until_idle()
+        self.assertEqual(self.w.of("tts_busy"), [])
+        self.assertEqual(self.w.spoken()[-4:], ["One.", "Two.", "Three.", "Four."])
+
+    def test_waits_until_everything_is_spoken_before_listening_again(self):
+        self.say("Tell me a story", "")
+        self.answer_with("Once upon a time. There was a robot. The end.")
+        self.wake()
+        self.run_until_idle()
+        last_speak = max(i for i, e in enumerate(self.w.events) if e[0] == "speak")
+        second_listen = [i for i, e in enumerate(self.w.events) if e[0] == "listen"][1]
+        self.assertLess(last_speak, second_listen)
+
+    def test_stop_talking_drops_queued_sentences(self):
+        self.m.voice.stop_talking()
+        self.assertIn(("tts_cancel",), self.w.events)
+        self.assertFalse(self.m.voice.is_busy())
 
 
 class TestConversation(AssistantTestCase):
@@ -162,11 +202,7 @@ class TestConversation(AssistantTestCase):
         self.answer_with("I'm great. Thanks", " for asking! What", " about you?")
         self.wake()
         self.run_until_idle()
-        answer = [(e[1], e[2]) for e in self.w.of("speak")]
-        self.assertEqual(
-            answer[:3],
-            [("I'm great.", False), ("Thanks for asking!", False), ("What about you?", False)],
-        )
+        self.assertEqual(self.w.spoken()[:3], ["I'm great.", "Thanks for asking!", "What about you?"])
 
     def test_speaking_state_is_set_before_first_sentence(self):
         self.say("Hi there, tell me a joke", "")
@@ -325,6 +361,7 @@ class TestFillerWords(AssistantTestCase):
 
     def test_weather_filler(self):
         self.m.get_weather("Berlin")
+        self.m.voice.wait()
         self.assertIn(self.w.spoken()[0], self.m.WEATHER_FILLERS)
 
 
