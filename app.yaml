@@ -5,10 +5,8 @@ bricks:
 - arduino:llm: {}
 - arduino:asr: {}
 - arduino:keyword_spotting: {}  # default model: wake word "Hey Arduino"
-- arduino:tts: {}
+- arduino:tts:
+    model: piper-tts-en  # German: piper-tts-de, together with LANGUAGE = "de" in python/config.py
 - arduino:weather_forecast: {}
 - arduino:sound_generator: {}
-# To pick a different voice/language, override the TTS model, e.g.:
-# - arduino:tts:
-#     model: melo-tts-en
 icon: 🎙️

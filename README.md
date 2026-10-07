@@ -16,13 +16,34 @@ that drops the custom Kokoro brick and uses only Arduino App Lab's built-in bric
 
 No `bricks/` folder, no custom code to maintain.
 
+## Language: English or German
+
+The assistant speaks and understands **English** or **German**. To switch:
+
+1. In `python/config.py` set `LANGUAGE = "de"` (or `"en"`).
+2. In `app.yaml` set the matching voice:
+   ```yaml
+   - arduino:tts:
+       model: piper-tts-de   # English: piper-tts-en
+   ```
+
+That switches speech recognition, the LLM's instructions, every phrase the
+assistant says, the words it understands ("Tschüss", "Danke"), the date it is
+told and the Wikipedia edition for web search. The wake word stays "Hey Arduino"
+(the built-in model only knows that one). If `LANGUAGE` and the voice in
+`app.yaml` don't match, the app prints a warning at start-up.
+
+All texts live in `python/languages/en.py` and `python/languages/de.py`. To add
+another language, copy one of them, translate it and register it in
+`python/languages/__init__.py`.
+
 ## Conversations
 
 Say **"Hey Arduino"** once, then talk normally:
 
 1. After each answer the assistant keeps listening for a follow-up
-   (`FOLLOW_UP_SECONDS`, default 6 s). No wake word needed.
-2. The LLM keeps the conversation history (`MEMORY_MESSAGES`), so follow-ups like
+   (`follow_up_seconds`, default 6 s). No wake word needed.
+2. The LLM keeps the conversation history (`memory_messages`), so follow-ups like
    "and tomorrow?" or "how old is he?" work.
 3. The conversation ends when you stay silent, or say "stop", "bye", "goodbye",
    "that's all" or "never mind". The history is then cleared, so the next
@@ -37,21 +58,22 @@ The trade-off: you can't interrupt it mid-answer.
 
 - **Sound effects**: a rising chime when it wakes up, a falling one when the
   conversation ends, a short jingle with every emotion symbol and a buzz on errors
-  (`sound_generator` brick, shares the speaker with TTS). Turn off with `SOUND_EFFECTS = False`.
+  (`sound_generator` brick, shares the speaker with TTS). Turn off with `sound_effects = False`.
 - **Filler words**: "Let me look that up." before a web search, "Let me check the
   weather." before a forecast, and "Hmm, let me think." when the first words take
-  longer than `THINKING_FILLER_SECONDS`.
+  longer than `thinking_filler_seconds`.
 - **Natural reactions**: instant replies to "thanks" and "hello" (time-aware:
   "Good morning!", "You're up late!") without waiting for the LLM, varied
   farewells ("Good night, sleep well!"), "Sorry, I didn't catch that" when it
   wakes but hears nothing, and a spoken apology instead of silence on errors.
   The system prompt also asks for varied, warm phrasing.
 - **Idle life**: while waiting, the LED matrix shows dim eyes that blink and look
-  around. After 5 minutes without a conversation (`SLEEP_AFTER_SECONDS`) it falls
+  around. After 5 minutes without a conversation (`sleep_after_seconds`) it falls
   asleep: closed eyes with a floating "z". "Hey Arduino" wakes it up again.
-  Set `IDLE_FACE` to `"awake"` or `"off"` to change that.
+  Set `idle_face` to `"awake"` or `"off"` to change that.
 
-All texts, sounds and timings are constants at the top of `python/main.py`.
+All settings are in `python/config.py`, all texts in `python/languages/`, the
+sounds in `python/assistant/sounds.py`.
 
 ## Tools: web search, weather and emotions
 
@@ -69,20 +91,20 @@ The local LLM can use three tools when it decides it needs them:
   `confused` (question mark) or `star`. Ask "Do you like me?" and it answers
   "Yes, I do!" with a heart. The symbol stays until the assistant listens again.
   To add a symbol, append a 13×8 bitmap to `EMOTION_BITMAPS` in `sketch.ino`
-  and its name to `EMOTIONS` in `main.py` (same position in both lists).
+  and its name to `EMOTIONS` in `python/assistant/face.py` (same position in both lists).
 
 **How it works:** the three functions are registered with the LLM brick
-(`LargeLanguageModel(system_prompt=..., tools=TOOLS)`). When the model returns a
+(`LargeLanguageModel(system_prompt=..., tools=tools.for_llm())`). When the model returns a
 real tool call, the brick runs the function and the model continues its answer
 with the result. The small model on the VENTUNO Q often writes the call into its
 answer as text instead (`show_emotion("heart")`, `Show_emotion(heart)`, a
 `{"tool_calls": [...]}` JSON block or `<tool_call>` tags), which the brick can't
-run. So `main.py` also finds those in the streamed answer, carries them out and
-never reads them aloud; for a lookup written as text, the result is sent back to
-the model in a second round (at most `MAX_LOOKUP_ROUNDS` per question).
+run. So the assistant also finds those in the streamed answer
+(`assistant/textcalls.py`), carries them out and never reads them aloud; for a
+lookup written as text, the result is sent back to the model in a second round (at most `max_lookup_rounds` per question).
 
 Web search and weather need internet access on the board. Set
-`USE_TOOLS = False` in `main.py` to turn all actions off.
+`use_tools = False` in `config.py` to turn all tools off.
 
 ## What changed vs. the Kokoro version
 
@@ -90,34 +112,24 @@ Web search and weather need internet access on the board. Set
   It plays directly through a `Speaker` peripheral, so the temporary `.wav`
   file and the `aplay` shell call are gone.
 - **Lower latency**: the LLM reply is streamed and each finished sentence goes
-  into a small speech queue (`Voice` in `main.py`), so the assistant starts
+  into a small speech queue (`assistant/voice.py`), so the assistant starts
   talking before the LLM has finished generating. The queue only uses
   `TextToSpeech.speak(text)`, so it works with older brick libraries too
   (0.11/0.12 have no background speech of their own).
 - **Real conversations** with follow-up questions, plus web search and weather tools (see above).
 - **Clean errors**: speech is cancelled and the assistant apologizes instead of going silent.
-- **Time zone** is a single constant (`TIME_ZONE`) at the top of `main.py`.
+- **English or German**, switchable in `config.py` (see above).
 - **Wake word** is now "Hey Arduino": the built-in keyword spotting model
   only knows that phrase (the original used a custom Edge Impulse model for "Ventuno").
 - The MCU sketch keeps the original animations and adds emotion symbols (`show_emotion` RPC) and an idle face (`set_idle_mode` RPC).
 
-## Voice / language
+## Voice
 
-Speech recognition is fixed to English (`ASR_LANGUAGE = "en"` in `main.py`) and the
-assistant always answers in English (`REPLY_LANGUAGE`). With automatic language
-detection, Whisper sometimes heard English as German ("Why is the sky blue?" became
-"Wo ist das Skyblue?"), and the default voice can only speak English. To use another
-language, change both settings and pick a matching TTS model below.
-
-The default model is English Piper. To change it, override the model in `app.yaml`:
-
-```yaml
-- arduino:tts:
-    model: melo-tts-en   # also: piper-tts-de, piper-tts-it, melo-tts-es, melo-tts-zh, ...
-```
-
-Built-in voices will sound different from Kokoro; that is the trade-off for
-staying on the stock bricks.
+The voices are the built-in Piper models (`piper-tts-en`, `piper-tts-de`, set in
+`app.yaml`). Speech recognition is fixed to the configured language: with
+automatic detection, Whisper sometimes heard English as German ("Why is the sky
+blue?" became "Wo ist das Skyblue?"). Built-in voices sound different from
+Kokoro; that is the trade-off for staying on the stock bricks.
 
 ## Hardware
 
@@ -126,7 +138,7 @@ staying on the stock bricks.
 - USB speaker / headset (a powered USB-C hub is recommended)
 
 By default TTS uses the first plugged speaker. To force a specific ALSA device,
-see the commented `Speaker(...)` line in `python/main.py`.
+see the commented `Speaker(...)` line in `python/assistant/setup.py`.
 
 ## Tests
 
@@ -136,11 +148,13 @@ The tests run on any computer with Python 3.10+, no board and no extra packages 
 python3 -m unittest discover -s tests -b -v
 ```
 
-- `tests/test_assistant.py` runs `python/main.py` against fake bricks
-  (`tests/fakes.py`) and checks the conversation flow, follow-ups, exit phrases,
-  quick replies, filler words, tools (web search, weather, emotions), sound
-  effects, the idle face timer and that `app.yaml`, `main.py` and `sketch.ino`
-  agree with each other.
+- `tests/test_assistant.py` runs the assistant against fake bricks
+  (`tests/fakes.py`, same API as the brick library on the board) and checks the
+  conversation flow, follow-ups, exit phrases, quick replies, filler words, tools
+  (web search, weather, emotions, also when written as text), sound effects, the
+  idle face timer, both languages, and that `app.yaml`, `python/` and
+  `sketch.ino` agree with each other. It also starts `main.py` the way App Lab
+  does.
 - `tests/test_sketch.py` compiles the real `sketch.ino` for your computer with small
   stand-ins for the Arduino libraries (`tests/sketch_host/`) and checks the LED
   frames: idle eyes, blinking, sleeping face, scanner, waves and all emotion
@@ -152,11 +166,27 @@ LED hardware are simulated.
 ## Project layout
 
 ```
-app.yaml
-python/main.py
-sketch/sketch.ino
-sketch/sketch.yaml
-tests/              # unit tests, see "Tests"
+app.yaml                    bricks, TTS voice
+python/
+  main.py                   entry point: builds the assistant, runs the App loop
+  config.py                 all settings, including LANGUAGE
+  languages/                everything the assistant says and understands
+    __init__.py             the Language structure
+    en.py, de.py            English and German
+  assistant/
+    setup.py                creates all parts and connects them
+    conversation.py         the conversation flow (state machine)
+    ears.py                 microphone, wake word, speech recognition
+    brain.py                the LLM: answers, lookups
+    tools.py                web search, weather, emotions (LLM tools)
+    textcalls.py            tool calls written as text, cleaning text for speech
+    expression.py           speech + face + sounds as one personality
+    voice.py                speech queue on top of the TTS brick
+    face.py                 the LED matrix (talks to sketch.ino)
+    sounds.py               chimes and jingles
+    timeofday.py            morning / afternoon / evening / night
+sketch/sketch.ino           LED matrix animations on the MCU
+tests/                      unit tests, see "Tests"
 ```
 
 ## License

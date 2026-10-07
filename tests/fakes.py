@@ -169,6 +169,11 @@ class KeywordSpotting:
         KeywordSpotting.instances.append(self)
 
     def on_detect(self, label, callback):
+        # Like the real brick: only plain functions without arguments
+        if not inspect.isfunction(callback):
+            raise TypeError("Callback must be a callable function.")
+        if inspect.signature(callback).parameters:
+            raise ValueError("Callback must not accept any arguments.")
         world.keyword_callbacks[label] = callback
 
     def start(self):

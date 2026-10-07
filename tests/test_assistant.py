@@ -1,44 +1,60 @@
-"""Feature tests for python/main.py, run against fake bricks (see fakes.py).
+"""Feature tests for the assistant (python/), run against fake bricks (see fakes.py).
 
 Run from the repository root:
-    python3 -m unittest discover -s tests -v
+    python3 -m unittest discover -s tests -b -v
 """
 
-import importlib.util
 import re
 import sys
+import tempfile
 import unittest
+from datetime import datetime
 from pathlib import Path
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).parent))
-import fakes  # noqa: E402
-
-ROOT = Path(__file__).resolve().parent.parent
-MAIN = ROOT / "python" / "main.py"
+TESTS = Path(__file__).resolve().parent
+ROOT = TESTS.parent
+PYTHON = ROOT / "python"
 SKETCH = ROOT / "sketch" / "sketch.ino"
 APP_YAML = ROOT / "app.yaml"
 
+sys.path.insert(0, str(TESTS))
+import fakes  # noqa: E402
 
-def load_main():
-    """Import a fresh copy of main.py with all bricks faked."""
-    fakes.install()
-    fakes.reset()
-    spec = importlib.util.spec_from_file_location("assistant_main", MAIN)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+fakes.install()
+sys.path.insert(0, str(PYTHON))
+import config  # noqa: E402
+from assistant import conversation as conversation_module  # noqa: E402
+from assistant import face as face_module  # noqa: E402
+from assistant import setup as setup_module  # noqa: E402
+from assistant import sounds as sounds_module  # noqa: E402
+from assistant import textcalls  # noqa: E402
+from assistant.timeofday import is_night, part_of_day  # noqa: E402
+from languages import load_language  # noqa: E402
+
+IDLE_STATE = conversation_module.IDLE
+EMOTIONS = face_module.EMOTIONS
+EARCONS = sounds_module.EARCONS
 
 
 class AssistantTestCase(unittest.TestCase):
+    language = "en"
+
     def setUp(self):
         # No real waiting: every time.sleep returns at once (and is recorded)
         self.sleep = mock.patch("time.sleep").start()
         self.addCleanup(mock.patch.stopall)
-        self.m = load_main()
+        fakes.reset()
         self.w = fakes.world
+        # no thinking filler unless a test asks for it
+        self.settings = config.Settings(language=self.language, thinking_filler_seconds=5.0)
+        self.c = setup_module.build_assistant(self.settings)
+        self.lang = self.c.language
+        self.brain = self.c.brain
+        self.expression = self.c.expression
+        self.tools = self.brain.tools
+        self.startup_events = list(self.w.events)
         self.w.events.clear()  # ignore start-up events unless a test needs them
-        self.m.THINKING_FILLER_SECONDS = 5.0  # no thinking filler unless a test asks for it
 
     # helpers ---------------------------------------------------------------
     def wake(self):
@@ -46,16 +62,20 @@ class AssistantTestCase(unittest.TestCase):
 
     def run_until_idle(self, max_steps=30):
         for _ in range(max_steps):
-            self.m.loop()
-            if self.m.app_state == "IDLE":
+            self.c.step()
+            if self.c.state == IDLE_STATE:
                 return
-        self.fail(f"assistant did not return to IDLE (state={self.m.app_state})")
+        self.fail(f"assistant did not return to IDLE (state={self.c.state})")
 
     def say(self, *utterances):
         self.w.utterances.extend(utterances)
 
     def answer_with(self, *chunks):
         self.w.llm_responder = lambda prompt, tools: iter(chunks)
+
+    def set_time(self, hour):
+        when = datetime(2026, 10, 7, hour, 30, tzinfo=self.settings.time_zone)
+        self.brain.now = self.c.now = lambda: when
 
 
 # ---------------------------------------------------------------------------
@@ -66,44 +86,45 @@ class TestWakeWordAndListening(AssistantTestCase):
 
     def test_wake_word_only_starts_listening_when_idle(self):
         self.wake()
-        self.assertEqual(self.m.app_state, "LISTENING")
-        self.m.app_state = "PROCESSING"
+        self.assertEqual(self.c.state, "LISTENING")
+        self.c.state = "THINKING"
         self.wake()
-        self.assertEqual(self.m.app_state, "PROCESSING")
+        self.assertEqual(self.c.state, "THINKING")
 
     def test_wake_chime_plays_before_microphone_opens(self):
         self.say("")
         self.wake()
-        self.m.loop()
+        self.c.step()
         first_tone = self.w.index(lambda e: e[0] == "tone")
         listen = self.w.index(lambda e: e[0] == "listen")
         self.assertNotEqual(first_tone, -1, "no wake chime")
         self.assertLess(first_tone, listen)
-        self.assertEqual([e[1] for e in self.w.of("tone")][:2], [n for n, _ in self.m.EARCONS["wake"]])
+        self.assertEqual([e[1] for e in self.w.of("tone")][:2], [n for n, _ in EARCONS["wake"]])
 
     def test_listening_sets_led_scanner(self):
         self.say("")
         self.wake()
-        self.m.loop()
-        self.assertIn(("bridge", "set_state", self.m.LISTENING), self.w.events)
+        self.c.step()
+        self.assertIn(("bridge", "set_state", face_module.LISTENING), self.w.events)
 
     def test_first_listen_uses_command_duration(self):
         self.say("")
         self.wake()
-        self.m.loop()
-        self.assertEqual(self.w.of("listen")[0][1], self.m.COMMAND_SECONDS)
+        self.c.step()
+        self.assertEqual(self.w.of("listen")[0][1], self.settings.command_seconds)
 
 
 class TestMicrophone(AssistantTestCase):
-    def test_main_creates_one_microphone(self):
-        self.assertEqual(MAIN.read_text().count("Microphone("), 1)
+    def test_code_creates_one_microphone(self):
+        sources = "".join(p.read_text() for p in PYTHON.rglob("*.py"))
+        self.assertEqual(sources.count("Microphone("), 1)
 
     def test_wake_word_and_speech_recognition_use_separate_streams(self):
         # One Microphone object must never be read by two bricks at once:
         # every read takes the chunk away from the other reader.
         kws_mic = fakes.KeywordSpotting.instances[0].mic
-        self.assertIsNot(kws_mic, self.m.asr.mic)
-        self.assertIs(self.m.asr.mic, self.m.mic)
+        self.assertIsNot(kws_mic, self.c.ears.asr.mic)
+        self.assertIs(self.c.ears.asr.mic, self.c.ears.mic)
 
     def test_wake_word_detector_is_never_stopped_by_the_app(self):
         # Stopping it while its reader thread runs crashes that thread on the board
@@ -152,7 +173,7 @@ class TestSpeechWithBoardLibrary(AssistantTestCase):
         self.assertEqual(self.w.spoken()[:2], ["First sentence.", "Second sentence."])
 
     def test_never_speaks_twice_at_the_same_time(self):
-        self.m.THINKING_FILLER_SECONDS = 0.01
+        self.settings.thinking_filler_seconds = 0.01
 
         def slow(prompt, tools):
             fakes.wait(0.1)
@@ -179,9 +200,9 @@ class TestSpeechWithBoardLibrary(AssistantTestCase):
         self.assertLess(last_speak, second_listen)
 
     def test_stop_talking_drops_queued_sentences(self):
-        self.m.voice.stop_talking()
+        self.expression.voice.stop_talking()
         self.assertIn(("tts_cancel",), self.w.events)
-        self.assertFalse(self.m.voice.is_busy())
+        self.assertFalse(self.expression.voice.is_busy())
 
 
 class TestConversation(AssistantTestCase):
@@ -197,9 +218,10 @@ class TestConversation(AssistantTestCase):
         self.assertIn("Paris.", self.w.spoken())
         self.assertIn("Rome.", self.w.spoken())
         listens = [e[1] for e in self.w.of("listen")]
-        self.assertEqual(listens, [self.m.COMMAND_SECONDS, self.m.FOLLOW_UP_SECONDS, self.m.FOLLOW_UP_SECONDS])
+        s = self.settings
+        self.assertEqual(listens, [s.command_seconds, s.follow_up_seconds, s.follow_up_seconds])
 
-    def test_streamed_answer_is_spoken_sentence_by_sentence_without_blocking(self):
+    def test_streamed_answer_is_spoken_sentence_by_sentence(self):
         self.say("How are you?", "")
         self.answer_with("I'm great. Thanks", " for asking! What", " about you?")
         self.wake()
@@ -211,34 +233,35 @@ class TestConversation(AssistantTestCase):
         self.answer_with("Why not.")
         self.wake()
         self.run_until_idle()
-        speaking = self.w.index(lambda e: e == ("bridge", "set_state", self.m.SPEAKING))
+        speaking = self.w.index(lambda e: e == ("bridge", "set_state", face_module.SPEAKING))
         first_speak = self.w.index(lambda e: e[0] == "speak")
         self.assertLess(speaking, first_speak)
 
     def test_prompt_contains_local_time_and_part_of_day(self):
+        self.set_time(9)
         self.say("What time is it?", "")
         self.wake()
         self.run_until_idle()
         prompt = self.w.of("llm")[0][1]
-        self.assertIn("current local time and date", prompt)
-        self.assertRegex(prompt, r"\((morning|afternoon|evening|night)\)")
+        self.assertIn("09:30 AM, Wednesday, October 7, 2026", prompt)
+        self.assertIn("(morning)", prompt)
         self.assertIn("User: What time is it?", prompt)
 
     def test_silence_in_follow_up_ends_quietly_and_clears_memory(self):
         self.say("Tell me something", "")
         self.wake()
         self.run_until_idle()
-        self.assertFalse(any(t in self.m.DIDNT_CATCH for t in self.w.spoken()))
+        self.assertFalse(any(t in self.lang.didnt_catch for t in self.w.spoken()))
         self.assertIn(("clear_memory",), self.w.events)
         tones = [e[1] for e in self.w.of("tone")]
-        self.assertEqual(tones[-2:], [n for n, _ in self.m.EARCONS["end"]], "no end chime")
-        self.assertEqual(self.w.bridge("set_state")[-1][2], self.m.IDLE)
+        self.assertEqual(tones[-2:], [n for n, _ in EARCONS["end"]], "no end chime")
+        self.assertEqual(self.w.bridge("set_state")[-1][2], face_module.IDLE)
 
     def test_silence_right_after_wake_word_says_didnt_catch_that(self):
         self.say("")
         self.wake()
         self.run_until_idle()
-        self.assertTrue(any(t in self.m.DIDNT_CATCH for t in self.w.spoken()))
+        self.assertTrue(any(t in self.lang.didnt_catch for t in self.w.spoken()))
         self.assertEqual(self.w.of("llm"), [])
 
     def test_exit_phrase_says_farewell_and_ends(self):
@@ -246,20 +269,19 @@ class TestConversation(AssistantTestCase):
         self.wake()
         self.run_until_idle()
         self.assertEqual(len(self.w.of("llm")), 1, "exit phrase must not go to the LLM")
-        farewells = ["Good night", "talk to you later", "call me", "See you"]
-        self.assertTrue(any(any(f in t for f in farewells) for t in self.w.spoken()))
+        all_farewells = [f for options in self.lang.farewells.values() for f in options]
+        self.assertIn(self.w.spoken()[-1], all_farewells)
         self.assertIn(("clear_memory",), self.w.events)
 
     def test_exit_phrase_detection(self):
-        stop = self.m.wants_to_stop
         for text in ["Stop.", "Goodbye!", "Okay, bye.", "Never mind.", "That's all"]:
-            self.assertTrue(stop(text), text)
+            self.assertTrue(self.lang.is_exit(text), text)
         for text in ["What about the bus stop near me?", "Tell me about Berlin", "Buy milk"]:
-            self.assertFalse(stop(text), text)
+            self.assertFalse(self.lang.is_exit(text), text)
 
     def test_conversation_memory_is_enabled(self):
-        self.assertEqual(fakes.LargeLanguageModel.last.memory, self.m.MEMORY_MESSAGES)
-        self.assertGreaterEqual(self.m.MEMORY_MESSAGES, 6)
+        self.assertEqual(fakes.LargeLanguageModel.last.memory, self.settings.memory_messages)
+        self.assertGreaterEqual(self.settings.memory_messages, 6)
 
 
 class TestNaturalReactions(AssistantTestCase):
@@ -268,40 +290,38 @@ class TestNaturalReactions(AssistantTestCase):
         self.wake()
         self.run_until_idle()
         self.assertEqual(self.w.of("llm"), [])
-        self.assertTrue(any(t in self.m.THANKS_REPLIES for t in self.w.spoken()))
-        self.assertIn(("bridge", "show_emotion", self.m.EMOTIONS.index("happy")), self.w.events)
+        self.assertTrue(any(t in self.lang.thanks_replies for t in self.w.spoken()))
+        self.assertIn(("bridge", "show_emotion", EMOTIONS.index("happy")), self.w.events)
 
     def test_greeting_gets_time_aware_reply_and_conversation_continues(self):
+        self.set_time(9)
         self.say("Hello!", "What's two plus two?", "")
         self.answer_with("Four.")
         self.wake()
         self.run_until_idle()
         self.assertEqual(len(self.w.of("llm")), 1)
-        greeting = self.w.spoken()[0]
-        self.assertTrue(re.search(r"Good (morning|afternoon|evening)|Hi!|Hey|night owl|up late", greeting), greeting)
+        self.assertIn(self.w.spoken()[0], self.lang.greetings["morning"])
 
     def test_quick_reply_patterns(self):
-        n = self.m.normalize
         for text in ["Thanks!", "Okay, thanks.", "Thank you very much.", "Thanks, Arduino!"]:
-            self.assertTrue(self.m.THANKS_RE.match(n(text)), text)
+            self.assertTrue(self.lang.is_thanks(text), text)
         for text in ["Hello!", "Good morning.", "Hey there"]:
-            self.assertTrue(self.m.GREETING_RE.match(n(text)), text)
+            self.assertTrue(self.lang.is_greeting(text), text)
         for text in ["Thank you for the info about Rome", "Hello, what's the weather?"]:
-            self.assertFalse(self.m.THANKS_RE.match(n(text)) or self.m.GREETING_RE.match(n(text)), text)
+            self.assertFalse(self.lang.is_thanks(text) or self.lang.is_greeting(text), text)
 
-    def test_greeting_and_farewell_depend_on_time_of_day(self):
-        with mock.patch.object(self.m, "part_of_day", return_value="morning"):
-            self.assertTrue(any("morning" in self.m.greeting_reply() or "Hey" in self.m.greeting_reply() for _ in range(20)))
-        with mock.patch.object(self.m, "part_of_day", return_value="night"):
-            self.assertTrue(all("late" in g or "night owl" in g for g in (self.m.greeting_reply() for _ in range(20))))
-        with mock.patch.object(self.m, "is_night", return_value=True):
-            self.assertTrue(all("night" in self.m.farewell().lower() for _ in range(20)))
+    def test_farewell_at_night(self):
+        self.set_time(23)
+        self.say("Bye!")
+        self.wake()
+        self.run_until_idle()
+        self.assertIn(self.w.spoken()[-1], self.lang.farewells["night"])
 
     def test_part_of_day_and_night_hours(self):
-        pod = self.m.part_of_day
-        self.assertEqual([pod(h) for h in (6, 13, 19, 23, 3)], ["morning", "afternoon", "evening", "night", "night"])
-        self.assertTrue(self.m.is_night(23))
-        self.assertFalse(self.m.is_night(12))
+        self.assertEqual([part_of_day(h) for h in (6, 13, 19, 23, 3)],
+                         ["morning", "afternoon", "evening", "night", "night"])
+        self.assertTrue(is_night(23, (22, 7)))
+        self.assertFalse(is_night(12, (22, 7)))
 
     def test_error_leads_to_spoken_apology_and_error_sound(self):
         def broken(prompt, tools):
@@ -312,16 +332,16 @@ class TestNaturalReactions(AssistantTestCase):
         self.say("Tell me something")
         self.wake()
         self.run_until_idle()
-        self.assertTrue(any(t in self.m.ERROR_REPLIES for t in self.w.spoken()))
+        self.assertTrue(any(t in self.lang.error_replies for t in self.w.spoken()))
         tones = [e[1] for e in self.w.of("tone")]
-        error = [n for n, _ in self.m.EARCONS["error"]]
+        error = [n for n, _ in EARCONS["error"]]
         self.assertTrue(any(tones[i:i + len(error)] == error for i in range(len(tones))), "no error sound")
-        self.assertEqual(self.m.app_state, "IDLE")
+        self.assertEqual(self.c.state, IDLE_STATE)
 
 
 class TestFillerWords(AssistantTestCase):
     def test_thinking_filler_when_llm_is_slow(self):
-        self.m.THINKING_FILLER_SECONDS = 0.05
+        self.settings.thinking_filler_seconds = 0.05
 
         def slow(prompt, tools):
             fakes.wait(0.4)
@@ -332,17 +352,17 @@ class TestFillerWords(AssistantTestCase):
         self.wake()
         self.run_until_idle()
         spoken = self.w.spoken()
-        self.assertIn(spoken[0], self.m.THINKING_FILLERS)
+        self.assertIn(spoken[0], self.lang.thinking_fillers)
         self.assertIn("Here is my answer.", spoken[1:])
 
     def test_no_thinking_filler_when_llm_is_fast(self):
-        self.m.THINKING_FILLER_SECONDS = 0.5
+        self.settings.thinking_filler_seconds = 0.5
         self.say("An easy question", "")
         self.answer_with("Easy.")
         self.wake()
         self.run_until_idle()
         fakes.wait(0.6)  # give a wrongly running timer the chance to fire
-        self.assertFalse(any(t in self.m.THINKING_FILLERS for t in self.w.spoken()))
+        self.assertFalse(any(t in self.lang.thinking_fillers for t in self.w.spoken()))
 
     def test_search_filler_is_spoken_before_the_answer(self):
         self.w.http_routes = {"https://api.duckduckgo.com/": {"AbstractText": "Mount Everest is 8849 m."}}
@@ -359,25 +379,33 @@ class TestFillerWords(AssistantTestCase):
         self.wake()
         self.run_until_idle()
         spoken = self.w.spoken()
-        self.assertIn(spoken[0], self.m.SEARCH_FILLERS)
+        self.assertIn(spoken[0], self.lang.search_fillers)
         self.assertTrue(spoken[1].startswith("It is about"))
-        self.assertFalse(any(t in self.m.THINKING_FILLERS for t in spoken), "thinking filler on top of search filler")
+        self.assertFalse(any(t in self.lang.thinking_fillers for t in spoken), "thinking filler on top of search filler")
 
     def test_weather_filler(self):
-        self.m.run_lookups([("get_weather", {"city": "Berlin"})])
-        self.m.voice.wait()
-        self.assertIn(self.w.spoken()[0], self.m.WEATHER_FILLERS)
+        self.tools.run("get_weather", {"city": "Berlin"})
+        self.expression.voice.wait()
+        self.assertIn(self.w.spoken()[0], self.lang.weather_fillers)
+
+    def test_no_filler_once_something_was_said(self):
+        self.expression.say("Let me check that.")
+        self.tools.run("get_weather", {"city": "Berlin"})
+        self.expression.voice.wait()
+        self.assertEqual(self.w.spoken(), ["Let me check that."])
 
 
 class TestTools(AssistantTestCase):
     def test_tools_are_registered_with_the_llm(self):
         tools = fakes.LargeLanguageModel.last.tools
         self.assertEqual(set(tools), {"web_search", "get_weather", "show_emotion"})
-        self.assertIs(tools["web_search"], self.m.web_search)
+        self.assertIs(tools["web_search"], self.tools.web_search)
 
     def test_no_tools_registered_when_switched_off(self):
-        main = MAIN.read_text()
-        self.assertIn("tools=TOOLS if USE_TOOLS else None", main)
+        fakes.reset()
+        setup_module.build_assistant(config.Settings(use_tools=False))
+        self.assertEqual(fakes.LargeLanguageModel.last.tools, {})
+        self.assertNotIn("web_search", fakes.LargeLanguageModel.last.system_prompt)
 
     def test_structured_tool_calls_run_through_the_brick(self):
         # When the runner returns a real tool call, the brick runs the function and then
@@ -395,21 +423,22 @@ class TestTools(AssistantTestCase):
         self.wake()
         self.run_until_idle()
         spoken = self.w.spoken()
-        self.assertIn(spoken[0], self.m.SEARCH_FILLERS)
+        self.assertIn(spoken[0], self.lang.search_fillers)
         self.assertEqual(spoken[1], "Wow, it's about eight thousand eight hundred meters high!")
-        self.assertIn(("bridge", "show_emotion", self.m.EMOTIONS.index("surprised")), self.w.events)
+        self.assertIn(("bridge", "show_emotion", EMOTIONS.index("surprised")), self.w.events)
         self.assertEqual(len(self.w.of("llm")), 1, "no extra round needed for a structured call")
 
     def test_tools_have_docstrings_for_the_llm(self):
-        for tool in (self.m.web_search, self.m.get_weather, self.m.show_emotion):
+        for tool in self.tools.for_llm():
             self.assertTrue(tool.__doc__ and "Args:" in tool.__doc__, tool.__name__)
 
     def test_system_prompt_mentions_every_tool(self):
+        prompt = fakes.LargeLanguageModel.last.system_prompt
         for name in ("web_search", "get_weather", "show_emotion"):
-            self.assertIn(name, self.m.SYSTEM_PROMPT)
+            self.assertIn(name, prompt)
 
-    def test_actions_can_be_switched_off(self):
-        self.m.USE_TOOLS = False
+    def test_tool_calls_written_as_text_are_ignored_when_tools_are_off(self):
+        self.settings.use_tools = False
         self.say("Do you like me?", "")
         self.answer_with('show_emotion("heart")\nYes!')
         self.wake()
@@ -423,42 +452,42 @@ class TestTools(AssistantTestCase):
             "https://en.wikipedia.org/w/api.php": {"query": {"search": [{"title": "Arduino"}]}},
             "https://en.wikipedia.org/api/rest_v1/page/summary/": {"extract": "Arduino is an open-source platform."},
         }
-        result = self.m.web_search("Arduino")
+        result = self.tools.web_search("Arduino")
         self.assertIn("DDG says hi.", result)
         self.assertIn("Topic A", result)
         self.assertIn("Arduino: Arduino is an open-source platform.", result)
 
     def test_web_search_result_is_capped_for_the_local_model(self):
         self.w.http_routes = {"https://api.duckduckgo.com/": {"AbstractText": "x" * 10000}}
-        self.assertLessEqual(len(self.m.web_search("long")), 2000)
+        self.assertLessEqual(len(self.tools.web_search("long")), 2000)
 
     def test_web_search_survives_network_errors(self):
         self.w.http_routes = {"https://": ConnectionError("offline")}
-        self.assertEqual(self.m.web_search("anything"), "No results found.")
+        self.assertEqual(self.tools.web_search("anything"), "No results found.")
 
     def test_get_weather_uses_builtin_brick_with_clamped_days(self):
-        result = self.m.get_weather("Berlin", days_ahead=10)
+        result = self.tools.get_weather("Berlin", days_ahead=10)
         city, kwargs = self.w.of("weather")[0][1:]
         self.assertEqual(city, "Berlin")
         self.assertEqual(kwargs["forecast_days"], 7)
-        self.assertEqual(kwargs["timezone"], str(self.m.TIME_ZONE))
+        self.assertEqual(kwargs["timezone"], str(self.settings.time_zone))
         self.assertIn("Slight rain", result)
 
     def test_show_emotion_draws_symbol_and_plays_jingle(self):
-        result = self.m.show_emotion("Heart")
+        result = self.tools.show_emotion("Heart")
         self.assertIn(("bridge", "show_emotion", 0), self.w.events)
-        self.assertEqual([e[1] for e in self.w.of("tone")], [n for n, _ in self.m.EARCONS["heart"]])
-        self.assertTrue(self.m.emotion_shown)
+        self.assertEqual([e[1] for e in self.w.of("tone")], [n for n, _ in EARCONS["heart"]])
+        self.assertTrue(self.expression.emotion_shown)
         self.assertIn("heart", result)
 
     def test_show_emotion_rejects_unknown_symbols(self):
-        result = self.m.show_emotion("dancing")
+        result = self.tools.show_emotion("dancing")
         self.assertEqual(self.w.bridge("show_emotion"), [])
         self.assertIn("Unknown emotion", result)
 
     def test_every_emotion_has_a_jingle(self):
-        for name in self.m.EMOTIONS:
-            self.assertIn(name, self.m.EARCONS, name)
+        for name in EMOTIONS:
+            self.assertIn(name, EARCONS, name)
 
     def test_emotion_stays_visible_after_speaking(self):
         def loving(prompt, tools):
@@ -471,11 +500,11 @@ class TestTools(AssistantTestCase):
         self.run_until_idle()
         self.assertIn(("bridge", "show_emotion", 0), self.w.events)
         self.assertIn("Yes, I do!", self.w.spoken())
-        self.assertIn(mock.call(self.m.EMOTION_HOLD_SECONDS), self.sleep.call_args_list)
+        self.assertIn(mock.call(self.settings.emotion_hold_seconds), self.sleep.call_args_list)
 
 
-class TestActionsWrittenAsText(AssistantTestCase):
-    """The model on the board writes actions into its answer. Cases copied from the board log."""
+class TestToolCallsWrittenAsText(AssistantTestCase):
+    """The model on the board writes tool calls into its answer. Cases copied from the board log."""
 
     def converse(self, question, first_answer, second_answer="Sure."):
         prompts = []
@@ -492,17 +521,17 @@ class TestActionsWrittenAsText(AssistantTestCase):
 
     def assertNothingTechnicalSpoken(self):
         for text in self.w.spoken():
-            for bad in ("show_emotion", "get_weather", "web_search", "tool_call", "{", "}", "*", "😊"):
+            for bad in ("show_emotion", "get_weather", "web_search", "tool_call", "{", "}", "*", "\U0001F60A"):
                 self.assertNotIn(bad, text.lower(), text)
 
     def test_joke_with_emotion_on_the_last_line(self):
         self.converse("Tell me a joke.", [
             "Why did the tomato turn red?  \n",
-            'Because it saw its salad dressing and thought, "I\u2019m in love!"  \n',
-            "I\u2019m *so* glad \U0001F60A you asked \u2014 I\u2019ve never seen a tomato so smitten! \U0001F60A  \n",
+            'Because it saw its salad dressing and thought, "I’m in love!"  \n',
+            "I’m *so* glad \U0001F60A you asked — I’ve never seen a tomato so smitten! \U0001F60A  \n",
             'show_emotion("heart")',
         ])
-        self.assertIn(("bridge", "show_emotion", self.m.EMOTIONS.index("heart")), self.w.events)
+        self.assertIn(("bridge", "show_emotion", EMOTIONS.index("heart")), self.w.events)
         self.assertNothingTechnicalSpoken()
         self.assertEqual(self.w.spoken()[0], "Why did the tomato turn red?")
         self.assertIn("so glad you asked", self.w.spoken()[2])
@@ -512,13 +541,13 @@ class TestActionsWrittenAsText(AssistantTestCase):
             "The sky appears blue because blue light scatters more. ",
             "I'm pretty sure that's why we see it like that. Show_emotion(heart)",
         ])
-        self.assertIn(("bridge", "show_emotion", self.m.EMOTIONS.index("heart")), self.w.events)
+        self.assertIn(("bridge", "show_emotion", EMOTIONS.index("heart")), self.w.events)
         self.assertNothingTechnicalSpoken()
         self.assertEqual(len(self.w.spoken()), 2)
 
     def test_weather_requested_as_json_tool_call(self):
         prompts = self.converse("What's the weather today?", [
-            "Ah, you mean the weather today? Well, let me check what\u2019s forecasted for now.  \n",
+            "Ah, you mean the weather today? Well, let me check what’s forecasted for now.  \n",
             '{"tool_calls": [{"type": "function", "function": {"name": "get_weather", "arguments": {"city": "Berlin", "days_ahead": 0}}}]}  \n',
             '{"tool_calls": []}  \n',
             'show_emotion("happy")',
@@ -528,7 +557,7 @@ class TestActionsWrittenAsText(AssistantTestCase):
         self.assertIn("Weather in Berlin: Slight rain", prompts[1])
         self.assertEqual(self.w.spoken(), [
             "Ah, you mean the weather today?",
-            "Well, let me check what\u2019s forecasted for now.",
+            "Well, let me check what’s forecasted for now.",
             "It's going to be a bit rainy in Berlin today.",
         ])
         self.assertNothingTechnicalSpoken()
@@ -539,7 +568,7 @@ class TestActionsWrittenAsText(AssistantTestCase):
             "<tool_call>\n", '{"name": "web_search", "arguments": {"query": "Mt. Everest height"}}', "\n</tool_call>",
         ], second_answer="About eight thousand eight hundred meters.")
         self.assertIn("8849", prompts[1])
-        self.assertIn(self.w.spoken()[0], self.m.SEARCH_FILLERS)  # nothing said yet, so a filler
+        self.assertIn(self.w.spoken()[0], self.lang.search_fillers)  # nothing said yet, so a filler
         self.assertEqual(self.w.spoken()[1], "About eight thousand eight hundred meters.")
 
     def test_python_style_call_with_keywords(self):
@@ -555,18 +584,13 @@ class TestActionsWrittenAsText(AssistantTestCase):
     def test_gives_up_after_too_many_lookups(self):
         self.w.http_routes = {"https://": ConnectionError("offline")}
         self.converse("Something obscure?", ['web_search("thing")'], second_answer='web_search("thing again")')
-        self.assertEqual(len(self.w.of("llm")), self.m.MAX_LOOKUP_ROUNDS + 1)
-        self.assertEqual(self.w.spoken()[-1], "Sorry, I couldn't find that out right now.")
+        self.assertEqual(len(self.w.of("llm")), self.settings.max_lookup_rounds + 1)
+        self.assertEqual(self.w.spoken()[-1], self.lang.couldnt_find)
 
-    def test_splitter_keeps_actions_in_one_piece(self):
-        pieces, rest = self.m.split_speakable('First. web_search("Mt. Everest") Second! Third')
+    def test_splitter_keeps_tool_calls_in_one_piece(self):
+        pieces, rest = textcalls.split_speakable('First. web_search("Mt. Everest") Second! Third')
         self.assertEqual(pieces, ["First.", ' web_search("Mt. Everest") Second!'])
         self.assertEqual(rest, " Third")
-
-    def test_speech_recognition_language_is_fixed(self):
-        self.assertEqual(self.m.asr.language, self.m.ASR_LANGUAGE)
-        self.assertEqual(self.m.ASR_LANGUAGE, "en")
-        self.assertIn("Always answer in English", self.m.SYSTEM_PROMPT)
 
 
 class TestIdleFace(AssistantTestCase):
@@ -574,49 +598,49 @@ class TestIdleFace(AssistantTestCase):
         return [e[2] for e in self.w.bridge("set_idle_mode")]
 
     def test_starts_awake(self):
-        self.m = load_main()
-        self.w = fakes.world
-        self.assertEqual(self.idle_modes(), [self.m.IDLE_AWAKE])
+        modes = [e[2] for e in self.startup_events if e[:2] == ("bridge", "set_idle_mode")]
+        self.assertEqual(modes, [face_module.IDLE_AWAKE])
 
     def test_falls_asleep_after_inactivity(self):
-        self.m.last_activity -= self.m.SLEEP_AFTER_SECONDS - 10
-        self.m.loop()
+        self.c.last_activity -= self.settings.sleep_after_seconds - 10
+        self.c.step()
         self.assertEqual(self.idle_modes(), [], "fell asleep too early")
-        self.m.last_activity -= 20
-        self.m.loop()
-        self.assertEqual(self.idle_modes(), [self.m.IDLE_SLEEPING])
-        self.m.loop()
-        self.assertEqual(self.idle_modes(), [self.m.IDLE_SLEEPING], "mode should only be sent when it changes")
+        self.c.last_activity -= 20
+        self.c.step()
+        self.assertEqual(self.idle_modes(), [face_module.IDLE_SLEEPING])
+        self.c.step()
+        self.assertEqual(self.idle_modes(), [face_module.IDLE_SLEEPING], "mode should only be sent when it changes")
 
     def test_default_sleep_delay_is_five_minutes(self):
-        self.assertEqual(self.m.SLEEP_AFTER_SECONDS, 300)
+        self.assertEqual(config.Settings().sleep_after_seconds, 300)
 
     def test_wakes_up_after_a_conversation(self):
-        self.m.last_activity -= self.m.SLEEP_AFTER_SECONDS + 1
-        self.m.loop()
+        self.c.last_activity -= self.settings.sleep_after_seconds + 1
+        self.c.step()
         self.say("Hello there", "")
         self.wake()
         self.run_until_idle()
-        self.assertEqual(self.idle_modes(), [self.m.IDLE_SLEEPING, self.m.IDLE_AWAKE])
+        self.assertEqual(self.idle_modes(), [face_module.IDLE_SLEEPING, face_module.IDLE_AWAKE])
 
     def test_off_and_awake_settings(self):
-        self.m.IDLE_FACE = "off"
-        self.m.update_idle_face()
-        self.m.IDLE_FACE = "awake"
-        self.m.last_activity -= 10_000
-        self.m.update_idle_face()
-        self.assertEqual(self.idle_modes(), [self.m.IDLE_OFF, self.m.IDLE_AWAKE])
+        self.settings.idle_face = "off"
+        self.c.update_idle_face()
+        self.settings.idle_face = "awake"
+        self.c.last_activity -= 10_000
+        self.c.update_idle_face()
+        self.assertEqual(self.idle_modes(), [face_module.IDLE_OFF, face_module.IDLE_AWAKE])
 
 
 class TestSoundEffects(AssistantTestCase):
     def test_sounds_can_be_switched_off(self):
-        self.m.SOUND_EFFECTS = False
-        self.m.play_earcon("wake")
-        self.m.show_emotion("heart")
-        self.assertEqual(self.w.of("tone"), [])
+        fakes.reset()
+        c = setup_module.build_assistant(config.Settings(sound_effects=False))
+        c.sounds.play("wake")
+        c.brain.tools.show_emotion("heart")
+        self.assertEqual(fakes.world.of("tone"), [])
 
     def test_broken_sound_never_breaks_the_conversation(self):
-        self.m.sfx.play_tone = mock.Mock(side_effect=OSError("speaker busy"))
+        self.c.sounds.generator.play_tone = mock.Mock(side_effect=OSError("speaker busy"))
         self.say("Tell me something", "")
         self.answer_with("Here you go.")
         self.wake()
@@ -625,19 +649,141 @@ class TestSoundEffects(AssistantTestCase):
 
     def test_all_earcon_notes_are_valid(self):
         note = re.compile(r"^(REST|[A-G](#|B)?[0-7])$")
-        for name, notes in self.m.EARCONS.items():
+        for name, notes in EARCONS.items():
             for n, seconds in notes:
                 self.assertRegex(n, note, name)
                 self.assertGreater(seconds, 0)
                 self.assertLessEqual(seconds, 0.5, f"{name} is too long for a chime")
 
 
+# ---------------------------------------------------------------------------
+class TestGerman(AssistantTestCase):
+    language = "de"
+
+    def test_everything_is_german(self):
+        self.assertEqual(self.c.ears.asr.language, "de")
+        self.assertIn("Antworte immer auf Deutsch", fakes.LargeLanguageModel.last.system_prompt)
+        self.assertIn("web_search", fakes.LargeLanguageModel.last.system_prompt)
+
+    def test_prompt_has_german_date(self):
+        self.set_time(17)
+        self.say("Wie spät ist es?", "")
+        self.wake()
+        self.run_until_idle()
+        prompt = self.w.of("llm")[0][1]
+        self.assertIn("Mittwoch, der 7. Oktober 2026, 17:30 Uhr", prompt)
+        self.assertIn("(Nachmittag)", prompt)
+        self.assertIn("Nutzer: Wie spät ist es?", prompt)
+
+    def test_quick_replies_and_farewell(self):
+        self.set_time(9)
+        self.say("Guten Morgen!", "Danke schön!", "Tschüss!")
+        self.wake()
+        self.run_until_idle()
+        spoken = self.w.spoken()
+        self.assertIn(spoken[0], self.lang.greetings["morning"])
+        self.assertIn(spoken[1], self.lang.thanks_replies)
+        self.assertIn(spoken[2], self.lang.farewells["morning"])
+        self.assertEqual(self.w.of("llm"), [])
+
+    def test_understands_german_phrases(self):
+        lang = self.lang
+        for text in ["Tschüss!", "Das war's.", "Okay, tschüss", "Vergiss es."]:
+            self.assertTrue(lang.is_exit(text), text)
+        for text in ["Danke!", "Vielen Dank.", "Danke dir", "Okay, danke."]:
+            self.assertTrue(lang.is_thanks(text), text)
+        for text in ["Hallo!", "Guten Abend.", "Servus", "Moin"]:
+            self.assertTrue(lang.is_greeting(text), text)
+        for text in ["Wo ist die Bushaltestelle?", "Danke für die Info über Rom", "Hallo, wie wird das Wetter?"]:
+            self.assertFalse(lang.is_exit(text) or lang.is_thanks(text) or lang.is_greeting(text), text)
+
+    def test_german_fillers_and_search(self):
+        self.w.http_routes = {"https://de.wikipedia.org/w/api.php": {"query": {"search": [{"title": "Zugspitze"}]}},
+                              "https://de.wikipedia.org/api/rest_v1/page/summary/": {"extract": "2962 Meter hoch."},
+                              "https://api.duckduckgo.com/": {}}
+
+        def responder(prompt, tools):
+            if prompt.startswith("[Ergebnisse"):
+                assert "2962" in prompt
+                yield "Die Zugspitze ist knapp dreitausend Meter hoch."
+            else:
+                yield 'web_search("Zugspitze Höhe")'
+
+        self.w.llm_responder = responder
+        self.say("Wie hoch ist die Zugspitze?", "")
+        self.wake()
+        self.run_until_idle()
+        spoken = self.w.spoken()
+        self.assertIn(spoken[0], self.lang.search_fillers)
+        self.assertEqual(spoken[1], "Die Zugspitze ist knapp dreitausend Meter hoch.")
+
+    def test_didnt_catch_in_german(self):
+        self.say("")
+        self.wake()
+        self.run_until_idle()
+        self.assertIn(self.w.spoken()[0], self.lang.didnt_catch)
+
+
+class TestLanguages(unittest.TestCase):
+    CODES = ("en", "de")
+
+    def test_unknown_language_is_rejected(self):
+        with self.assertRaises(ValueError):
+            load_language("fr")
+
+    def test_every_language_is_complete(self):
+        parts = {"morning", "afternoon", "evening", "night"}
+        for code in self.CODES:
+            with self.subTest(language=code):
+                lang = load_language(code)
+                self.assertEqual(lang.code, code)
+                self.assertEqual(set(lang.greetings), parts)
+                self.assertEqual(set(lang.farewells), parts)
+                self.assertEqual(set(lang.part_of_day_names), parts)
+                for name in ("thinking_fillers", "search_fillers", "weather_fillers", "didnt_catch",
+                             "thanks_replies", "error_replies"):
+                    self.assertTrue(getattr(lang, name), name)
+                for options in list(lang.greetings.values()) + list(lang.farewells.values()):
+                    self.assertTrue(options)
+                self.assertEqual(len(lang.weekdays), 7)
+                self.assertEqual(len(lang.months), 12)
+                for field in ("{now}", "{part_of_day}", "{text}"):
+                    self.assertIn(field, lang.user_prompt)
+                self.assertIn("{results}", lang.lookup_results_prompt)
+                for tool in ("web_search", "get_weather", "show_emotion"):
+                    self.assertIn(tool, lang.tools_prompt)
+                for emotion in EMOTIONS:
+                    self.assertIn(emotion, lang.tools_prompt)
+                self.assertTrue(lang.lookup_results_prompt.startswith("[") and lang.tts_model)
+
+    def test_said_phrases_are_not_recognized_as_commands(self):
+        # e.g. the farewell must not be mistaken for a greeting, a filler not for an exit
+        for code in self.CODES:
+            lang = load_language(code)
+            for text in lang.thinking_fillers + lang.search_fillers + lang.weather_fillers:
+                self.assertFalse(lang.is_exit(text), (code, text))
+
+    def test_tts_model_check(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app_yaml = Path(tmp) / "app.yaml"
+            app_yaml.write_text("bricks:\n- arduino:tts:\n    model: piper-tts-de  # comment\n")
+            self.assertTrue(setup_module.check_tts_model(load_language("de"), app_yaml))
+            self.assertFalse(setup_module.check_tts_model(load_language("en"), app_yaml))
+            app_yaml.write_text("bricks:\n- arduino:tts: {}\n")  # brick default is English
+            self.assertTrue(setup_module.check_tts_model(load_language("en"), app_yaml))
+            self.assertFalse(setup_module.check_tts_model(load_language("de"), app_yaml))
+
+    def test_repository_app_yaml_matches_config_language(self):
+        language = load_language(config.LANGUAGE)
+        self.assertTrue(setup_module.check_tts_model(language, APP_YAML))
+
+
 class TestProjectConsistency(unittest.TestCase):
-    """Static checks across app.yaml, main.py and sketch.ino."""
+    """Static checks across app.yaml, python/ and sketch.ino."""
 
     @classmethod
     def setUpClass(cls):
-        cls.main = MAIN.read_text()
+        cls.python = "\n".join(p.read_text() for p in PYTHON.rglob("*.py"))
         cls.sketch = SKETCH.read_text()
         cls.app = APP_YAML.read_text()
 
@@ -650,21 +796,20 @@ class TestProjectConsistency(unittest.TestCase):
         self.assertNotIn("ei-model", self.app, "custom Edge Impulse model in app.yaml")
 
     def test_every_used_brick_is_declared_in_app_yaml(self):
-        used = set(re.findall(r"from arduino\.app_bricks\.(\w+) import", self.main))
+        used = set(re.findall(r"from arduino\.app_bricks\.(\w+) import", self.python))
         declared = set(re.findall(r"^- arduino:(\w+):", self.app, re.M))
         self.assertEqual(used - declared, set())
 
     def test_python_only_calls_rpcs_the_sketch_provides(self):
-        called = set(re.findall(r'Bridge\.call\("(\w+)"', self.main))
+        called = set(re.findall(r'Bridge\.call\("(\w+)"', self.python))
         provided = set(re.findall(r'Bridge\.provide\("(\w+)"', self.sketch))
+        self.assertTrue(called)
         self.assertEqual(called - provided, set())
 
     def test_emotions_match_sketch_bitmaps(self):
-        names = re.findall(r"\{ // (\d+): (\w+)", self.sketch)  # e.g. "{ // 0: heart"
-        python_order = re.search(r"EMOTIONS = \[(.*?)\]", self.main).group(1)
-        python_names = re.findall(r'"(\w+)"', python_order)
-        self.assertEqual([n for _, n in names], python_names)
-        self.assertEqual(int(re.search(r"NUM_EMOTIONS = (\d+)", self.sketch).group(1)), len(python_names))
+        names = re.findall(r"\{ // (\d+): (\w+)", self.sketch)
+        self.assertEqual([n for _, n in names], EMOTIONS)
+        self.assertEqual(int(re.search(r"NUM_EMOTIONS = (\d+)", self.sketch).group(1)), len(EMOTIONS))
 
     def test_license_and_credit(self):
         self.assertIn("GNU GENERAL PUBLIC LICENSE", (ROOT / "LICENSE").read_text())
@@ -673,3 +818,20 @@ class TestProjectConsistency(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestEntryPoint(unittest.TestCase):
+    def test_main_py_runs_like_on_the_board(self):
+        """App Lab runs `python /app/python/main.py` from /app: check the imports work that way."""
+        import os
+        import subprocess
+
+        with tempfile.TemporaryDirectory() as tmp:
+            # Installs the fake bricks before main.py runs (the fake App.run returns at once)
+            Path(tmp, "sitecustomize.py").write_text(
+                f"import sys\nsys.path.insert(0, {str(TESTS)!r})\nimport fakes\nfakes.install()\n")
+            env = dict(os.environ, PYTHONPATH=tmp)
+            result = subprocess.run([sys.executable, str(PYTHON / "main.py")], cwd=ROOT, env=env,
+                                    capture_output=True, text=True, timeout=60)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Ready!", result.stdout)
