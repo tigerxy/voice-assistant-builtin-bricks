@@ -311,9 +311,11 @@ if SOUND_EFFECTS:
         print(f"⚠️ Sound effects disabled: {e}")
         sfx = None
 
-mic_spotter = Microphone()
-mic_asr = Microphone()
-asr = AutomaticSpeechRecognition(mic_asr)
+# One microphone for both the wake word and speech recognition. They take turns:
+# the wake word detector listens while idle and is paused during a conversation,
+# so the two never read from the microphone at the same time.
+mic = Microphone()
+asr = AutomaticSpeechRecognition(mic)
 
 # IDLE -> LISTENING -> PROCESSING -> FOLLOW_UP -> PROCESSING -> ... -> IDLE
 app_state = "IDLE"
@@ -327,13 +329,12 @@ def on_keyword_detected():
         app_state = "LISTENING"
 
 
-spotter = KeywordSpotting(mic=mic_spotter, confidence=0.90, debounce_sec=2.0)
+spotter = KeywordSpotting(mic=mic, confidence=0.90, debounce_sec=2.0)
 # The built-in keyword spotting model only knows "hey_arduino"
 spotter.on_detect("hey_arduino", on_keyword_detected)
 
-mic_spotter.start()
 asr.start()
-spotter.start()
+spotter.start()  # also starts the microphone
 
 current_idle_mode = None
 last_activity = time.monotonic()  # end of the last conversation (or app start)
@@ -362,6 +363,16 @@ print("\n✅ All systems online! 💤 Listening for 'Hey Arduino'...")
 # ---------------------------------------------------------------------------
 # Conversation
 # ---------------------------------------------------------------------------
+def pause_wake_word():
+    """Stop the wake word detector so speech recognition has the microphone to itself."""
+    App.stop_brick(spotter)  # stops its threads and the microphone
+
+
+def resume_wake_word():
+    """Hand the microphone back to the wake word detector."""
+    App.start_brick(spotter)  # restarts the microphone and its threads
+
+
 def end_conversation(message, sound="end"):
     global app_state, last_activity
     print(message)
@@ -371,6 +382,7 @@ def end_conversation(message, sound="end"):
     last_activity = time.monotonic()  # wide awake again; the sleep countdown restarts
     update_idle_face()
     Bridge.call("set_state", IDLE)
+    resume_wake_word()
     app_state = "IDLE"
     print("💤 Listening for 'Hey Arduino'...")
 
@@ -380,7 +392,7 @@ def listen(seconds):
     text = ""
     partial = ""
 
-    mic_asr.start()
+    mic.start()
     time.sleep(0.1)
     Bridge.call("set_state", LISTENING)
     print(f"\n🟢 Listening ({seconds}s)...")
@@ -403,7 +415,7 @@ def listen(seconds):
         print(f"\n⚠️ Unexpected ASR error: {e}")
 
     time.sleep(1.5)  # let ASR release its resources
-    mic_asr.stop()
+    mic.stop()  # closed while the assistant talks, so it never hears itself
     return text or partial
 
 
@@ -475,6 +487,7 @@ def loop():
     if app_state in ("LISTENING", "FOLLOW_UP"):
         just_woke = app_state == "LISTENING"
         if just_woke:
+            pause_wake_word()  # the conversation takes over the microphone
             play_earcon("wake", block=True)  # "I'm listening" chime
         user_text = listen(COMMAND_SECONDS if just_woke else FOLLOW_UP_SECONDS)
 
@@ -538,7 +551,6 @@ finally:
     tts.stop()
     if sfx:
         sfx.stop()
-    mic_spotter.stop()
-    mic_asr.stop()
+    mic.stop()
     asr.stop()
     Bridge.call("set_state", IDLE)

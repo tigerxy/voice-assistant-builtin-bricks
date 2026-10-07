@@ -8,7 +8,9 @@ Events are tuples:
     ("bridge", rpc_name, arg)      Bridge.call to the MCU sketch
     ("speak", text, block)         TextToSpeech.speak
     ("tone", note)                 SoundGenerator.play_tone
-    ("listen", seconds)            ASR transcribe_stream started
+    ("listen", seconds, mic_on, kws_on)  ASR started; was the mic on / the wake word detector running?
+    ("mic", "start" | "stop")      Microphone started or stopped
+    ("app", "start_brick" | "stop_brick", brick_class_name)
     ("llm", prompt)                LLM chat_stream called
     ("clear_memory",)              LLM memory cleared
     ("http", url)                  web request
@@ -67,6 +69,16 @@ class _App:
     def run(user_loop=None):
         pass  # tests drive main.loop() themselves
 
+    @staticmethod
+    def start_brick(brick):
+        world.log("app", "start_brick", type(brick).__name__)
+        brick.start()
+
+    @staticmethod
+    def stop_brick(brick):
+        world.log("app", "stop_brick", type(brick).__name__)
+        brick.stop()
+
 
 # --- arduino.app_bricks.llm -----------------------------------------------------
 class LargeLanguageModel:
@@ -103,7 +115,7 @@ class _Chunk:
 
 
 class AutomaticSpeechRecognition:
-    def __init__(self, mic):
+    def __init__(self, mic=None):
         self.mic = mic
 
     def start(self):
@@ -114,7 +126,8 @@ class AutomaticSpeechRecognition:
 
     @contextmanager
     def transcribe_stream(self, duration=7):
-        world.log("listen", duration)
+        kws_on = any(k.running for k in KeywordSpotting.instances)
+        world.log("listen", duration, bool(self.mic and self.mic.started), kws_on)
         text = world.utterances.pop(0) if world.utterances else ""
         chunks = []
         if text:
@@ -124,14 +137,26 @@ class AutomaticSpeechRecognition:
 
 # --- arduino.app_bricks.keyword_spotting ----------------------------------------
 class KeywordSpotting:
+    instances = []
+
     def __init__(self, mic=None, confidence=0.8, debounce_sec=1.0):
         self.confidence = confidence
+        self.mic = mic
+        self.running = False
+        KeywordSpotting.instances.append(self)
 
     def on_detect(self, label, callback):
         world.keyword_callbacks[label] = callback
 
     def start(self):
-        pass
+        self.running = True
+        if self.mic:
+            self.mic.start()
+
+    def stop(self):
+        self.running = False
+        if self.mic:
+            self.mic.stop()
 
 
 # --- arduino.app_bricks.tts ---------------------------------------------------
@@ -191,14 +216,21 @@ class SoundGenerator:
 
 # --- arduino.app_peripherals.microphone ----------------------------------------------
 class Microphone:
+    instances = []
+
     def __init__(self, *args, **kwargs):
-        pass
+        self.started = False
+        Microphone.instances.append(self)
 
     def start(self):
-        pass
+        if not self.started:  # like the real one: starting twice is a no-op
+            self.started = True
+            world.log("mic", "start")
 
     def stop(self):
-        pass
+        if self.started:
+            self.started = False
+            world.log("mic", "stop")
 
 
 # --- requests (only what main.py uses) --------------------------------------------
@@ -266,6 +298,8 @@ def install():
 def reset():
     global world
     world.__init__()
+    Microphone.instances.clear()
+    KeywordSpotting.instances.clear()
     return world
 
 

@@ -94,6 +94,54 @@ class TestWakeWordAndListening(AssistantTestCase):
         self.assertEqual(self.w.of("listen")[0][1], self.m.COMMAND_SECONDS)
 
 
+class TestMicrophone(AssistantTestCase):
+    def test_only_one_microphone_is_created(self):
+        self.assertEqual(len(fakes.Microphone.instances), 1)
+
+    def test_wake_word_and_speech_recognition_share_it(self):
+        mic = fakes.Microphone.instances[0]
+        self.assertIs(fakes.KeywordSpotting.instances[0].mic, mic)
+        self.assertIs(self.m.asr.mic, mic)
+
+    def test_microphone_is_listening_for_the_wake_word_at_start(self):
+        # (The fake App.run() returns at once, so main.py's shutdown code already ran:
+        # check the start-up events instead of the current state.)
+        self.m = load_main()
+        self.w = fakes.world
+        self.assertEqual(self.w.of("mic")[0], ("mic", "start"))
+        self.assertTrue(fakes.KeywordSpotting.instances[0].running)
+
+    def test_wake_word_detector_is_paused_whenever_speech_is_recognized(self):
+        self.say("What is two plus two?", "And three plus three?", "")
+        self.wake()
+        self.run_until_idle()
+        listens = self.w.of("listen")
+        self.assertEqual(len(listens), 3)
+        for _, _, mic_on, kws_on in listens:
+            self.assertTrue(mic_on, "microphone must be on while recognizing speech")
+            self.assertFalse(kws_on, "wake word detector must not read the microphone at the same time")
+
+    def test_wake_word_detector_resumes_after_the_conversation(self):
+        self.say("Hello there", "")
+        self.wake()
+        self.run_until_idle()
+        self.assertEqual(
+            [e[1] for e in self.w.of("app")], ["stop_brick", "start_brick"],
+            "pause once at the start, resume once at the end",
+        )
+        self.assertTrue(fakes.KeywordSpotting.instances[0].running)
+        self.assertTrue(fakes.Microphone.instances[0].started)
+
+    def test_microphone_is_off_while_the_assistant_speaks(self):
+        self.say("Tell me something", "")
+        self.answer_with("Here you go.")
+        self.wake()
+        self.run_until_idle()
+        speak = self.w.index(lambda e: e == ("speak", "Here you go.", False))
+        last_mic = [e for e in self.w.events[:speak] if e[0] == "mic"][-1]
+        self.assertEqual(last_mic, ("mic", "stop"))
+
+
 class TestConversation(AssistantTestCase):
     def test_answer_is_spoken_and_conversation_continues_without_wake_word(self):
         self.say("What is the capital of France?", "And of Italy?", "")
