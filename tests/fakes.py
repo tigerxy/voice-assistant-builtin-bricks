@@ -16,7 +16,8 @@ Events are tuples:
     ("speak", text)                TextToSpeech.speak (blocks while "speaking")
     ("tts_busy", text)             speak() called while another speak() was still running
     ("tone", note)                 SoundGenerator.play_tone
-    ("listen", seconds, mic_on)    ASR started; was its microphone on?
+    ("listen", timeout, mic_on, vad_ms)  ASR sentence started; was its mic on? VAD pause setting
+    ("asr_cancel",)                ASR session cancelled (nobody spoke)
     ("mic", "start" | "stop", owner)  a Microphone started/stopped; owner is "asr" or "kws"
     ("app", "start_brick" | "stop_brick", brick_class_name)
     ("llm", prompt)                LLM chat_stream called
@@ -38,7 +39,7 @@ class World:
 
     def __init__(self):
         self.events = []
-        self.utterances = []        # what the "user" says on each listen; "" = silence
+        self.utterances = []        # what the "user" says on each listen: str or Speech; "" = silence
         self.llm_responder = None   # fn(prompt, tools) -> iterable of text chunks
         self.http_routes = {}       # url prefix -> json payload, or Exception to raise
         self.weather = ("Slight rain", "rainy")
@@ -134,11 +135,35 @@ class _Chunk:
         self.data = data
 
 
+class Speech:
+    """What the "user" says on one listen: starts after `delay` seconds of silence and
+    takes `duration` seconds to say (time between the first partial and the full text).
+
+    A plain string in world.utterances means Speech(text). "" means nobody speaks.
+    """
+
+    def __init__(self, text, delay=0.0, duration=0.0):
+        self.text = text
+        self.delay = delay
+        self.duration = duration
+
+
 class AutomaticSpeechRecognition:
+    """Same API as the ASR brick on the board (0.11/0.12).
+
+    transcribe_sentence_stream() ends like the real one: when the speech service's
+    VAD detects the end of a sentence (a non-empty full_text), at `timeout`, or
+    when cancel() is called. Silence keeps the stream open (it doesn't just end).
+    """
+
+    _DEFAULT_VAD_MS = 700
+    MAX_FAKE_WAIT = 2.0  # never block a test longer than this
+
     def __init__(self, mic=None, language=None):
         self.language = language
         self.mic = mic if mic is not None else Microphone()
         self.mic.owner = "asr"
+        self._cancelled = threading.Event()
 
     def start(self):
         pass
@@ -146,14 +171,39 @@ class AutomaticSpeechRecognition:
     def stop(self):
         pass
 
+    def cancel(self):
+        world.log("asr_cancel")
+        self._cancelled.set()
+
+    def transcribe_sentence_stream(self, timeout=0):
+        world.log("listen", timeout, self.mic.started, self._DEFAULT_VAD_MS)
+        self._cancelled.clear()
+        speech = world.utterances.pop(0) if world.utterances else ""
+        if isinstance(speech, str):
+            speech = Speech(speech)
+        return contextmanager(self._sentence)(speech, timeout)
+
+    def _sentence(self, speech, timeout):
+        limit = min(timeout or self.MAX_FAKE_WAIT, self.MAX_FAKE_WAIT)
+
+        def events():
+            if not speech.text:  # nobody speaks: wait for cancel() or the timeout
+                self._cancelled.wait(limit)
+                return
+            if speech.delay and self._cancelled.wait(min(speech.delay, limit)):
+                return  # cancelled before the user started talking
+            text = speech.text
+            yield _Chunk("partial_text", text[: len(text) // 2])
+            if speech.duration and self._cancelled.wait(min(speech.duration, limit)):
+                return  # cancelled while the user was still talking
+            yield _Chunk("full_text", "")  # e.g. a noise segment: the real one keeps going
+            yield _Chunk("full_text", text)
+
+        yield events()
+
     @contextmanager
-    def transcribe_stream(self, duration=7):
-        world.log("listen", duration, self.mic.started)
-        text = world.utterances.pop(0) if world.utterances else ""
-        chunks = []
-        if text:
-            chunks = [_Chunk("partial_text", text[: len(text) // 2]), _Chunk("full_text", text)]
-        yield iter(chunks)
+    def transcribe_stream(self, duration=0):
+        raise AssertionError("use transcribe_sentence_stream (VAD), not a fixed duration")
 
 
 # --- arduino.app_bricks.keyword_spotting ----------------------------------------

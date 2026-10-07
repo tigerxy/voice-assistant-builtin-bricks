@@ -68,8 +68,8 @@ class Conversation:
         if just_woke:
             self.sounds.play("wake", block=True)  # "I'm listening" chime
         self.face.listening()
-        seconds = self.settings.command_seconds if just_woke else self.settings.follow_up_seconds
-        self.user_text = self.ears.listen(seconds)
+        wait = self.settings.wait_for_speech_seconds if just_woke else self.settings.follow_up_wait_seconds
+        self.user_text = self.ears.listen(wait)
         said = self.user_text
         lang = self.language
 

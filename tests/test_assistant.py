@@ -47,7 +47,13 @@ class AssistantTestCase(unittest.TestCase):
         fakes.reset()
         self.w = fakes.world
         # no thinking filler unless a test asks for it
-        self.settings = config.Settings(language=self.language, thinking_filler_seconds=5.0)
+        self.settings = config.Settings(
+            language=self.language,
+            thinking_filler_seconds=5.0,
+            # short real waits, so silence doesn't slow the tests down
+            wait_for_speech_seconds=0.05,
+            follow_up_wait_seconds=0.05,
+        )
         self.c = setup_module.build_assistant(self.settings)
         self.lang = self.c.language
         self.brain = self.c.brain
@@ -107,11 +113,83 @@ class TestWakeWordAndListening(AssistantTestCase):
         self.c.step()
         self.assertIn(("bridge", "set_state", face_module.LISTENING), self.w.events)
 
-    def test_first_listen_uses_command_duration(self):
+
+
+class TestListeningWithVAD(AssistantTestCase):
+    """No fixed recording length: the speech service's VAD ends each sentence."""
+
+    def listen_waits(self):
+        listen = mock.patch.object(self.c.ears, "listen", wraps=self.c.ears.listen).start()
+        return listen
+
+    def test_sentence_ends_with_the_vad_not_a_fixed_duration(self):
+        # The fake ASR fails on transcribe_stream(duration): only the VAD-based stream may be used
+        self.say("What is the capital of France?", "")
+        self.answer_with("Paris.")
+        self.wake()
+        self.run_until_idle()
+        timeout, mic_on, vad_ms = self.w.of("listen")[0][1:]
+        self.assertEqual(timeout, self.settings.max_sentence_seconds)
+        self.assertTrue(mic_on)
+        self.assertEqual(vad_ms, self.settings.end_of_speech_ms)
+        self.assertEqual(self.w.of("llm")[0][1].split("User: ")[-1], "What is the capital of France?")
+
+    def test_noise_segments_do_not_end_the_sentence(self):
+        # the fake ASR sends an empty full_text before the real one
+        self.say("Hello there, how are you", "")
+        self.answer_with("Fine.")
+        self.wake()
+        self.run_until_idle()
+        self.assertIn("how are you", self.w.of("llm")[0][1])
+
+    def test_gives_up_when_nobody_starts_talking(self):
         self.say("")
         self.wake()
         self.c.step()
-        self.assertEqual(self.w.of("listen")[0][1], self.settings.command_seconds)
+        self.assertIn(("asr_cancel",), self.w.events)
+
+    def test_waits_for_someone_who_starts_talking_a_little_late(self):
+        self.settings.wait_for_speech_seconds = 1.0
+        self.say(fakes.Speech("Tell me a joke", delay=0.1), "")
+        self.answer_with("Why not.")
+        self.wake()
+        self.c.step()
+        self.assertNotIn(("asr_cancel",), self.w.events)
+        self.assertEqual(self.c.user_text, "Tell me a joke")
+
+    def test_long_sentence_is_not_cut_off(self):
+        # starts in time, but takes much longer than the wait time to finish
+        self.settings.wait_for_speech_seconds = 0.1
+        self.say(fakes.Speech("Tell me everything about the history of Rome", delay=0.02, duration=0.4), "")
+        self.answer_with("Okay.")
+        self.wake()
+        self.c.step()
+        self.assertNotIn(("asr_cancel",), self.w.events)
+        self.assertEqual(self.c.user_text, "Tell me everything about the history of Rome")
+
+    def test_too_late_counts_as_silence(self):
+        self.settings.wait_for_speech_seconds = 0.05
+        self.say(fakes.Speech("Hello?", delay=1.0))
+        self.wake()
+        self.run_until_idle()
+        self.assertIn(("asr_cancel",), self.w.events)
+        self.assertTrue(any(t in self.lang.didnt_catch for t in self.w.spoken()))
+
+    def test_wait_times_after_wake_word_and_after_an_answer(self):
+        self.settings.follow_up_wait_seconds = 0.06  # different from wait_for_speech_seconds
+        listen = self.listen_waits()
+        self.say("What is the capital of France?", "And of Italy?", "")
+        self.answer_with("Rome.")
+        self.wake()
+        self.run_until_idle()
+        s = self.settings
+        self.assertEqual([c.args[0] for c in listen.call_args_list],
+                         [s.wait_for_speech_seconds, s.follow_up_wait_seconds, s.follow_up_wait_seconds])
+
+    def test_defaults(self):
+        s = config.Settings()
+        self.assertGreater(s.end_of_speech_ms, 700, "a bit longer than the service default, for short pauses")
+        self.assertGreater(s.max_sentence_seconds, s.wait_for_speech_seconds)
 
 
 class TestMicrophone(AssistantTestCase):
@@ -141,7 +219,7 @@ class TestMicrophone(AssistantTestCase):
         self.run_until_idle()
         listens = self.w.of("listen")
         self.assertEqual(len(listens), 3)
-        self.assertTrue(all(mic_on for _, _, mic_on in listens))
+        self.assertTrue(all(mic_on for _, _, mic_on, _ in listens))
 
     def test_microphone_is_off_while_the_assistant_speaks(self):
         self.say("Tell me something", "")
@@ -217,9 +295,7 @@ class TestConversation(AssistantTestCase):
         self.assertEqual(len(self.w.of("llm")), 2, "follow-up question was not processed")
         self.assertIn("Paris.", self.w.spoken())
         self.assertIn("Rome.", self.w.spoken())
-        listens = [e[1] for e in self.w.of("listen")]
-        s = self.settings
-        self.assertEqual(listens, [s.command_seconds, s.follow_up_seconds, s.follow_up_seconds])
+        self.assertEqual(len(self.w.of("listen")), 3)
 
     def test_streamed_answer_is_spoken_sentence_by_sentence(self):
         self.say("How are you?", "")

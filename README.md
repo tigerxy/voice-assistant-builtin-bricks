@@ -42,12 +42,25 @@ another language, copy one of them, translate it and register it in
 Say **"Hey Arduino"** once, then talk normally:
 
 1. After each answer the assistant keeps listening for a follow-up
-   (`follow_up_seconds`, default 6 s). No wake word needed.
+   (`follow_up_wait_seconds`, default 5 s to start talking). No wake word needed.
 2. The LLM keeps the conversation history (`memory_messages`), so follow-ups like
    "and tomorrow?" or "how old is he?" work.
 3. The conversation ends when you stay silent, or say "stop", "bye", "goodbye",
    "that's all" or "never mind". The history is then cleared, so the next
    "Hey Arduino" starts fresh.
+
+### Listening ends when you stop talking (VAD)
+
+There is no fixed recording length. The speech recognition service on the board
+(Qualcomm's audio service behind the `asr` brick) runs a voice activity detector
+(VAD): when you pause for `end_of_speech_ms` (default 900 ms), it ends the
+sentence and the assistant answers right away. Long questions are not cut off
+(up to the `max_sentence_seconds` safety limit, default 30 s). If nobody starts
+talking within `wait_for_speech_seconds` after the wake word (default 6 s), or
+`follow_up_wait_seconds` after an answer (default 5 s), listening stops early.
+The app uses the brick's `transcribe_sentence_stream()` for this, and sets the
+pause length through the brick's internal `_DEFAULT_VAD_MS`, since there is no
+public setting for it.
 
 The speech recognition microphone only opens after the assistant has finished
 speaking, so it never hears itself. The wake word detector reads its own stream

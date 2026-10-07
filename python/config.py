@@ -21,8 +21,12 @@ class Settings:
     # Listening
     wake_word: str = "hey_arduino"   # the built-in keyword spotting model only knows this one
     wake_confidence: float = 0.90
-    command_seconds: int = 7         # how long to listen right after the wake word
-    follow_up_seconds: int = 6       # how long to wait for a reply before ending the conversation
+    # Listening ends when you stop talking: the speech recognition service detects
+    # the end of your sentence with its voice activity detector (VAD).
+    end_of_speech_ms: int = 900      # pause that ends a sentence (the service's default is 700)
+    wait_for_speech_seconds: float = 6    # after the wake word: give up if nobody starts talking
+    follow_up_wait_seconds: float = 5     # after an answer: end the conversation if nobody replies
+    max_sentence_seconds: int = 30   # safety limit for one sentence
 
     # Thinking
     memory_messages: int = 16        # conversation history kept for the LLM
