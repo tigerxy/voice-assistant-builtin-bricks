@@ -53,28 +53,35 @@ The trade-off: you can't interrupt it mid-answer.
 
 All texts, sounds and timings are constants at the top of `python/main.py`.
 
-## Tools: web search, weather and emotions
+## Actions: web search, weather and emotions
 
-The local LLM can call three tools when it decides it needs them:
+The local LLM can use three actions when it decides it needs them:
 
-- **`web_search(query)`**: looks things up via the DuckDuckGo Instant Answer API
+- **`web_search("query")`**: looks things up via the DuckDuckGo Instant Answer API
   and Wikipedia (no API key). There is no web search brick in Arduino's library,
-  so this is a small Python function passed to the LLM brick's `tools=` argument.
-  It's good for facts and background knowledge, not for breaking news.
-- **`get_weather(city, days_ahead)`**: uses the built-in `weather_forecast` brick
+  so this is a small Python function. It's good for facts and background
+  knowledge, not for breaking news.
+- **`get_weather("City", days_ahead)`**: uses the built-in `weather_forecast` brick
   (open-meteo.com, no API key). It returns a description like "Slight rain",
   not temperatures.
-
-- **`show_emotion(emotion)`**: shows a pulsing symbol on the LED matrix while the
+- **`show_emotion("heart")`**: shows a pulsing symbol on the LED matrix while the
   assistant answers: `heart`, `happy`, `sad`, `surprised`, `wink`, `angry`,
   `confused` (question mark) or `star`. Ask "Do you like me?" and it answers
   "Yes, I do!" with a heart. The symbol stays until the assistant listens again.
   To add a symbol, append a 13×8 bitmap to `EMOTION_BITMAPS` in `sketch.ino`
   and its name to `EMOTIONS` in `main.py` (same position in both lists).
 
-Web search and weather need internet access on the board. If your LLM runner doesn't support tool
-calling, set `USE_TOOLS = False` in `main.py` and the assistant works offline
-without them.
+**How it works:** the model runner on the VENTUNO Q doesn't return real
+(structured) tool calls. The model writes them into its answer as text, in
+different styles (`show_emotion("heart")`, `Show_emotion(heart)`, a
+`{"tool_calls": [...]}` JSON block or `<tool_call>` tags). So the system
+prompt describes the actions, and `main.py` finds them in the streamed answer,
+carries them out and never reads them aloud. After `web_search` or
+`get_weather` the result goes back to the model, which then answers
+(at most `MAX_LOOKUP_ROUNDS` lookups per question).
+
+Web search and weather need internet access on the board. Set
+`USE_TOOLS = False` in `main.py` to turn all actions off.
 
 ## What changed vs. the Kokoro version
 
@@ -94,6 +101,12 @@ without them.
 - The MCU sketch keeps the original animations and adds emotion symbols (`show_emotion` RPC) and an idle face (`set_idle_mode` RPC).
 
 ## Voice / language
+
+Speech recognition is fixed to English (`ASR_LANGUAGE = "en"` in `main.py`) and the
+assistant always answers in English (`REPLY_LANGUAGE`). With automatic language
+detection, Whisper sometimes heard English as German ("Why is the sky blue?" became
+"Wo ist das Skyblue?"), and the default voice can only speak English. To use another
+language, change both settings and pick a matching TTS model below.
 
 The default model is English Piper. To change it, override the model in `app.yaml`:
 

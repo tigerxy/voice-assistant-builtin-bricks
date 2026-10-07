@@ -1,3 +1,4 @@
+import json
 import queue
 import random
 import re
@@ -24,8 +25,13 @@ from arduino.app_peripherals.microphone import Microphone
 TIME_ZONE = ZoneInfo("Europe/Berlin")  # your IANA time zone
 COMMAND_SECONDS = 7        # how long to listen right after the wake word
 FOLLOW_UP_SECONDS = 6      # how long to wait for a reply before ending the conversation
-MEMORY_MESSAGES = 16       # conversation history kept for the LLM (tool calls count too)
-USE_TOOLS = True           # set False if your LLM runner doesn't support tool calling
+MEMORY_MESSAGES = 16       # conversation history kept for the LLM
+USE_TOOLS = True           # let the LLM search the web, check the weather and show emotions
+MAX_LOOKUP_ROUNDS = 2      # how often the LLM may look something up before it has to answer
+# Language you speak to the assistant and it answers in. The default TTS voice only
+# speaks English: to change it, also set a matching TTS model in app.yaml.
+ASR_LANGUAGE = "en"        # None = detect automatically (can mistake English for German)
+REPLY_LANGUAGE = "English"
 SEARCH_TIMEOUT = 8         # seconds per web request
 SEARCH_LANG = "en"         # Wikipedia language edition used by web_search
 SOUND_EFFECTS = True       # short chimes and jingles via the sound_generator brick
@@ -74,22 +80,29 @@ EARCONS = {
     "star":      [("C6", 0.06), ("E6", 0.06), ("G6", 0.06), ("C7", 0.2)],
 }
 
-SENTENCE_END = re.compile(r"(?<=[.!?])\s+")
-
 SYSTEM_PROMPT = (
     "You are a friendly voice assistant having a spoken conversation. "
     "Sound natural and warm, like a person: vary how you start your sentences, and feel free to use "
     "small interjections such as oh, hmm or well. Don't greet the user unless they greet you. "
     "Keep each answer brief and conversational, at most two or three sentences. "
-    "Write numbers, symbols and units as words, for example 86% becomes 86 percent, and never use emojis or lists. "
-    "The conversation continues after your answer, so you may ask a short follow-up question when it helps. "
-    "Use the web_search tool when you need facts you are not sure about, details about people, places or things, "
-    "or anything that may have changed recently. Use the get_weather tool for weather questions. "
-    "Do not use web_search or get_weather for small talk or things you already know well. "
-    "When your answer has a clear feeling, call show_emotion once to show a matching symbol on your LED face, "
-    "for example heart for affection or love, happy for joy, sad for bad news, surprised for amazing facts, "
-    "wink for jokes, confused when you don't understand, star for praise or success. Never mention the symbol in your answer."
+    f"Always answer in {REPLY_LANGUAGE}. Everything you write is read aloud: write numbers, symbols and units "
+    "as words, for example 86% becomes 86 percent, and never use emojis, markdown, lists or code. "
+    "The conversation continues after your answer, so you may ask a short follow-up question when it helps."
 )
+
+ACTIONS_PROMPT = (
+    "\n\nYou can use three actions. To use one, write it exactly like this on its own line:\n"
+    'web_search("short search query")  - look up facts you are not sure about: people, places, things, '
+    "or anything that may have changed recently.\n"
+    'get_weather("City", 0)  - weather forecast. The number is days ahead: 0 today, 1 tomorrow, up to 6.\n'
+    'show_emotion("heart")  - show a symbol on your LED face: heart, happy, sad, surprised, wink, angry, '
+    "confused or star.\n"
+    "When you need web_search or get_weather, write only that line and stop: you will get the result, then answer. "
+    "Use show_emotion at most once, at the start of an answer with a clear feeling, for example heart for "
+    "affection, wink for jokes, sad for bad news. Don't use actions for small talk or things you know well."
+)
+if USE_TOOLS:
+    SYSTEM_PROMPT += ACTIONS_PROMPT
 
 # ---------------------------------------------------------------------------
 # Small human touches: time of day, fillers, sounds
@@ -265,7 +278,6 @@ def web_search(query: str) -> str:
         Text snippets from the search results.
     """
     print(f"\n🔎 Searching the web for: {query}")
-    say_filler(SEARCH_FILLERS)
     found = []
     for source in (_duckduckgo, _wikipedia):
         try:
@@ -289,9 +301,11 @@ def get_weather(city: str, days_ahead: int = 0) -> str:
     Returns:
         A short description of the expected weather.
     """
-    days_ahead = max(0, min(int(days_ahead), 6))
+    try:
+        days_ahead = max(0, min(int(days_ahead), 6))
+    except (TypeError, ValueError):
+        days_ahead = 0
     print(f"\n🌦️ Getting weather for {city} (+{days_ahead} days)")
-    say_filler(WEATHER_FILLERS)
     try:
         data = _weather.get_forecast_by_city(city, timezone=str(TIME_ZONE), forecast_days=days_ahead + 1)
         return f"Weather in {city}: {data.description} ({data.category})."
@@ -328,16 +342,184 @@ def show_emotion(emotion: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Actions the LLM writes into its answer
+# ---------------------------------------------------------------------------
+# The local model on the board does not return real (structured) tool calls: it
+# writes them into its answer as text, in different styles, for example
+#   show_emotion("heart")      Show_emotion(heart)
+#   {"tool_calls": [{"type": "function", "function": {"name": "get_weather", "arguments": {...}}}]}
+#   <tool_call>{"name": "web_search", "arguments": {"query": "..."}}</tool_call>
+# So the answer is scanned for these: they are carried out and never read aloud.
+ACTION_NAMES = ("web_search", "get_weather", "show_emotion")
+LOOKUP_ACTIONS = ("web_search", "get_weather")
+CALL_RE = re.compile(r"\b(web_search|get_weather|show_emotion)\s*\(([^()]*)\)", re.I)
+TOOL_TAG_RE = re.compile(r"</?\s*tool_calls?\s*>", re.I)
+EMOJI_RE = re.compile("[\U0001F000-\U0001FAFF\u2600-\u27BF\uFE0F\u200D]")
+MARKDOWN_RE = re.compile(r"[*_`#~]+")
+
+
+def _json_end(text, start):
+    """Index just after the JSON object starting at text[start] ('{'), or -1 if incomplete."""
+    depth, in_string, escaped = 0, False, False
+    for i in range(start, len(text)):
+        c = text[i]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif c == "\\":
+                escaped = True
+            elif c == '"':
+                in_string = False
+        elif c == '"':
+            in_string = True
+        elif c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                return i + 1
+    return -1
+
+
+def _actions_from_json(obj):
+    calls = obj["tool_calls"] if isinstance(obj.get("tool_calls"), list) else [obj]
+    found = []
+    for call in calls:
+        if not isinstance(call, dict):
+            continue
+        fn = call.get("function") if isinstance(call.get("function"), dict) else call
+        name = str(fn.get("name", "")).lower()
+        args = fn.get("arguments", fn.get("parameters", {}))
+        if isinstance(args, str):
+            try:
+                args = json.loads(args)
+            except ValueError:
+                args = {"text": args}
+        if name in ACTION_NAMES:
+            found.append((name, args if isinstance(args, dict) else {}))
+    return found
+
+
+def _actions_from_call(name, arg_text):
+    """Arguments of a written call like get_weather("Berlin", 1) or get_weather(city="Berlin")."""
+    keywords = {k.lower(): v.strip().strip("'\"") for k, v in re.findall(r"(\w+)\s*=\s*(\"[^\"]*\"|'[^']*'|[^,]+)", arg_text)}
+    positional = [p.strip().strip("'\"") for p in arg_text.split(",") if p.strip() and "=" not in p]
+    args = dict(keywords)
+    if name == "web_search" and positional:
+        args.setdefault("query", ", ".join(positional))
+    elif name == "show_emotion" and positional:
+        args.setdefault("emotion", positional[0])
+    elif name == "get_weather":
+        numbers = [p for p in positional if re.fullmatch(r"-?\d+", p)]
+        words = [p for p in positional if p not in numbers]
+        if words:
+            args.setdefault("city", words[0])
+        if numbers:
+            args.setdefault("days_ahead", numbers[0])
+    return args
+
+
+def clean_speech(text):
+    """Remove everything that must not be read aloud."""
+    text = TOOL_TAG_RE.sub(" ", text)
+    if "{" in text:  # an incomplete action, e.g. the answer was cut off
+        text = text[: text.index("{")]
+    text = EMOJI_RE.sub("", text)
+    text = MARKDOWN_RE.sub("", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text if re.search(r"\w", text) else ""
+
+
+def extract_actions(text):
+    """Split a piece of the answer into (text to speak, [(action, args), ...])."""
+    actions, kept, i = [], [], 0
+    while i < len(text):
+        if text[i] == "{":
+            end = _json_end(text, i)
+            if end > 0:
+                blob = text[i:end]
+                try:
+                    obj = json.loads(blob)
+                except ValueError:
+                    obj = None
+                if isinstance(obj, dict) and ("tool_calls" in obj or "arguments" in obj or obj.get("name") in ACTION_NAMES):
+                    actions.extend(_actions_from_json(obj))
+                    i = end
+                    continue
+        kept.append(text[i])
+        i += 1
+
+    def take_call(match):
+        name = match.group(1).lower()
+        actions.append((name, _actions_from_call(name, match.group(2))))
+        return " "
+
+    rest = CALL_RE.sub(take_call, "".join(kept))
+    return clean_speech(rest), actions
+
+
+def split_speakable(buffer):
+    """Split complete sentences and lines off the streamed answer: returns (pieces, rest).
+
+    Never splits inside (...) or {...}, so an action like web_search("Mt. Everest")
+    stays in one piece.
+    """
+    pieces, start, depth, in_string = [], 0, 0, False
+    for i, c in enumerate(buffer):
+        if depth and c == '"':
+            in_string = not in_string
+        if in_string:
+            continue
+        if c in "({[":
+            depth += 1
+        elif c in ")}]":
+            depth = max(0, depth - 1)
+        elif depth == 0 and c == "\n":
+            pieces.append(buffer[start:i])
+            start = i + 1
+        elif depth == 0 and c in ".!?" and i + 1 < len(buffer) and buffer[i + 1] in " \t\n":
+            pieces.append(buffer[start:i + 1])
+            start = i + 1
+    return [p for p in pieces if p.strip()], buffer[start:]
+
+
+def _arg(args, *names, default=""):
+    for name in names:
+        if args.get(name) not in (None, ""):
+            return args[name]
+    values = [v for v in args.values() if v not in (None, "")]
+    return values[0] if values and default == "" else default
+
+
+def run_lookups(lookups):
+    """Carry out web_search / get_weather and return the results as the next message for the LLM."""
+    if not turn_has_spoken.is_set():
+        say_filler(SEARCH_FILLERS if lookups[0][0] == "web_search" else WEATHER_FILLERS)
+    results = []
+    for name, args in lookups[:3]:
+        if name == "web_search":
+            query = str(_arg(args, "query", "q", "text"))
+            results.append(f'web_search("{query}"):\n{web_search(query)}')
+        else:
+            city = str(_arg(args, "city", "location", "place"))
+            days = _arg(args, "days_ahead", "days", "day", default=0)
+            results.append(f'get_weather("{city}", {days}):\n{get_weather(city, days)}')
+    return (
+        "[Results of your actions]\n" + "\n\n".join(results) + "\n\n"
+        "Now answer my question in one or two short spoken sentences, using these results. "
+        "Do not write web_search or get_weather again."
+    )
+
+
+# ---------------------------------------------------------------------------
 # Bricks
 # ---------------------------------------------------------------------------
 print("=" * 50)
 print("🚀 PHASE 1: Loading LOCAL LLM into RAM...")
 print("=" * 50)
 
-llm = LargeLanguageModel(
-    system_prompt=SYSTEM_PROMPT,
-    tools=[web_search, get_weather, show_emotion] if USE_TOOLS else None,
-)
+# No tools= here: the runner on the board doesn't return real tool calls (see "Actions" above)
+llm = LargeLanguageModel(system_prompt=SYSTEM_PROMPT)
 llm.with_memory(MEMORY_MESSAGES)
 
 try:
@@ -375,7 +557,7 @@ if SOUND_EFFECTS:
 # (ALSA shared mode). The two must not read from one Microphone object: each
 # read takes the chunk away from the other, so both would get half the audio.
 mic = Microphone()
-asr = AutomaticSpeechRecognition(mic)
+asr = AutomaticSpeechRecognition(mic, language=ASR_LANGUAGE)
 
 # IDLE -> LISTENING -> PROCESSING -> FOLLOW_UP -> PROCESSING -> ... -> IDLE
 app_state = "IDLE"
@@ -471,8 +653,48 @@ def wants_to_stop(text):
     return any(t == p or t.startswith(p + " ") or t.endswith(" " + p) for p in EXIT_PHRASES)
 
 
+def answer_round(prompt):
+    """Stream one LLM reply: speak its sentences, carry out emotions and collect lookups."""
+    lookups = []
+
+    def handle(piece):
+        had_lookups = bool(lookups)
+        text, actions = extract_actions(piece)
+        for name, args in actions if USE_TOOLS else []:
+            if name == "show_emotion":
+                show_emotion(str(_arg(args, "emotion", "name", "symbol")))
+            elif (name, args) not in lookups:
+                lookups.append((name, args))
+        if text and not had_lookups:
+            turn_has_spoken.set()
+            Bridge.call("set_state", SPEAKING)
+            voice.say(text)
+
+    print("🧠 AI thinking (local): ", end="", flush=True)
+    buffer = ""
+    stream = llm.chat_stream(prompt)
+    try:
+        for chunk in stream:
+            print(chunk, end="", flush=True)
+            buffer += chunk
+            # Hand every finished sentence to the speech queue right away,
+            # so speech starts before the LLM has finished generating.
+            pieces, buffer = split_speakable(buffer)
+            for piece in pieces:
+                handle(piece)
+            if lookups:
+                break  # the model asked for data: whatever it writes next would be made up
+        else:
+            if buffer.strip():
+                handle(buffer)
+    finally:
+        stream.close()
+    print()
+    return lookups
+
+
 def think_and_speak(command):
-    """Stream the LLM reply (with tool calls if needed) and speak it sentence by sentence."""
+    """Answer the user: stream the LLM reply, look things up if it asks for it, speak it."""
     global emotion_shown
     emotion_shown = False
     turn_has_spoken.clear()
@@ -490,32 +712,17 @@ def think_and_speak(command):
     filler_timer = threading.Timer(THINKING_FILLER_SECONDS, thinking_filler)
     filler_timer.daemon = True
     filler_timer.start()
-
-    def speak_sentence(sentence):
-        turn_has_spoken.set()
-        Bridge.call("set_state", SPEAKING)
-        voice.say(sentence)
-
-    print("🧠 AI thinking (local): ", end="", flush=True)
-    buffer = ""
     try:
-        for chunk in llm.chat_stream(prompt):
-            print(chunk, end="", flush=True)
-            buffer += chunk
-
-            # Hand every finished sentence to the TTS queue right away,
-            # so speech starts before the LLM has finished generating.
-            parts = SENTENCE_END.split(buffer)
-            for sentence in parts[:-1]:
-                if sentence.strip():
-                    speak_sentence(sentence)
-            buffer = parts[-1]
+        for lookup_round in range(MAX_LOOKUP_ROUNDS + 1):
+            lookups = answer_round(prompt)
+            if not lookups:
+                break
+            if lookup_round == MAX_LOOKUP_ROUNDS:
+                voice.say("Sorry, I couldn't find that out right now.")
+                break
+            prompt = run_lookups(lookups)
     finally:
         filler_timer.cancel()
-    print()
-
-    if buffer.strip():
-        speak_sentence(buffer)
 
     # Wait until everything is spoken, so the microphone doesn't hear the assistant itself
     voice.wait()

@@ -156,8 +156,10 @@ class TestSpeechWithBoardLibrary(AssistantTestCase):
 
         def slow(prompt, tools):
             fakes.wait(0.1)
-            tools["web_search"]("anything")
-            yield "One. Two. Three. Four."
+            if prompt.startswith("[Results"):
+                yield "One. Two. Three. Four."
+            else:
+                yield 'web_search("anything")'
 
         self.w.http_routes = {"https://": ConnectionError("offline")}
         self.w.llm_responder = slow
@@ -346,9 +348,11 @@ class TestFillerWords(AssistantTestCase):
         self.w.http_routes = {"https://api.duckduckgo.com/": {"AbstractText": "Mount Everest is 8849 m."}}
 
         def uses_search(prompt, tools):
-            result = tools["web_search"]("Mount Everest height")
-            assert "8849" in result
-            yield "It is about eight thousand eight hundred meters."
+            if prompt.startswith("[Results"):
+                assert "8849" in prompt
+                yield "It is about eight thousand eight hundred meters."
+            else:
+                yield 'web_search("Mount Everest height")'
 
         self.w.llm_responder = uses_search
         self.say("How high is Mount Everest?", "")
@@ -360,22 +364,32 @@ class TestFillerWords(AssistantTestCase):
         self.assertFalse(any(t in self.m.THINKING_FILLERS for t in spoken), "thinking filler on top of search filler")
 
     def test_weather_filler(self):
-        self.m.get_weather("Berlin")
+        self.m.run_lookups([("get_weather", {"city": "Berlin"})])
         self.m.voice.wait()
         self.assertIn(self.w.spoken()[0], self.m.WEATHER_FILLERS)
 
 
 class TestTools(AssistantTestCase):
-    def test_tools_are_registered_with_the_llm(self):
-        self.assertEqual(set(fakes.LargeLanguageModel.last.tools), {"web_search", "get_weather", "show_emotion"})
+    def test_no_structured_tools_are_bound(self):
+        # The runner on the board doesn't return real tool calls; actions are parsed from the text.
+        self.assertEqual(fakes.LargeLanguageModel.last.tools, {})
 
     def test_tools_have_docstrings_for_the_llm(self):
         for tool in (self.m.web_search, self.m.get_weather, self.m.show_emotion):
             self.assertTrue(tool.__doc__ and "Args:" in tool.__doc__, tool.__name__)
 
     def test_system_prompt_mentions_every_tool(self):
-        for name in ("web_search", "get_weather", "show_emotion"):
-            self.assertIn(name, self.m.SYSTEM_PROMPT)
+        for example in ('web_search("', 'get_weather("', 'show_emotion("'):
+            self.assertIn(example, self.m.SYSTEM_PROMPT)
+
+    def test_actions_can_be_switched_off(self):
+        self.m.USE_TOOLS = False
+        self.say("Do you like me?", "")
+        self.answer_with('show_emotion("heart")\nYes!')
+        self.wake()
+        self.run_until_idle()
+        self.assertEqual(self.w.bridge("show_emotion"), [])
+        self.assertEqual(self.w.spoken(), ["Yes!"])
 
     def test_web_search_combines_duckduckgo_and_wikipedia(self):
         self.w.http_routes = {
@@ -422,7 +436,7 @@ class TestTools(AssistantTestCase):
 
     def test_emotion_stays_visible_after_speaking(self):
         def loving(prompt, tools):
-            tools["show_emotion"]("heart")
+            yield 'show_emotion("heart")\n'
             yield "Yes, I do!"
 
         self.w.llm_responder = loving
@@ -432,6 +446,101 @@ class TestTools(AssistantTestCase):
         self.assertIn(("bridge", "show_emotion", 0), self.w.events)
         self.assertIn("Yes, I do!", self.w.spoken())
         self.assertIn(mock.call(self.m.EMOTION_HOLD_SECONDS), self.sleep.call_args_list)
+
+
+class TestActionsWrittenAsText(AssistantTestCase):
+    """The model on the board writes actions into its answer. Cases copied from the board log."""
+
+    def converse(self, question, first_answer, second_answer="Sure."):
+        prompts = []
+
+        def responder(prompt, tools):
+            prompts.append(prompt)
+            yield from (second_answer if prompt.startswith("[Results") else first_answer)
+
+        self.w.llm_responder = responder
+        self.say(question, "")
+        self.wake()
+        self.run_until_idle()
+        return prompts
+
+    def assertNothingTechnicalSpoken(self):
+        for text in self.w.spoken():
+            for bad in ("show_emotion", "get_weather", "web_search", "tool_call", "{", "}", "*", "😊"):
+                self.assertNotIn(bad, text.lower(), text)
+
+    def test_joke_with_emotion_on_the_last_line(self):
+        self.converse("Tell me a joke.", [
+            "Why did the tomato turn red?  \n",
+            'Because it saw its salad dressing and thought, "I\u2019m in love!"  \n',
+            "I\u2019m *so* glad \U0001F60A you asked \u2014 I\u2019ve never seen a tomato so smitten! \U0001F60A  \n",
+            'show_emotion("heart")',
+        ])
+        self.assertIn(("bridge", "show_emotion", self.m.EMOTIONS.index("heart")), self.w.events)
+        self.assertNothingTechnicalSpoken()
+        self.assertEqual(self.w.spoken()[0], "Why did the tomato turn red?")
+        self.assertIn("so glad you asked", self.w.spoken()[2])
+
+    def test_emotion_written_without_quotes_and_capitalized(self):
+        self.converse("Why is the sky blue?", [
+            "The sky appears blue because blue light scatters more. ",
+            "I'm pretty sure that's why we see it like that. Show_emotion(heart)",
+        ])
+        self.assertIn(("bridge", "show_emotion", self.m.EMOTIONS.index("heart")), self.w.events)
+        self.assertNothingTechnicalSpoken()
+        self.assertEqual(len(self.w.spoken()), 2)
+
+    def test_weather_requested_as_json_tool_call(self):
+        prompts = self.converse("What's the weather today?", [
+            "Ah, you mean the weather today? Well, let me check what\u2019s forecasted for now.  \n",
+            '{"tool_calls": [{"type": "function", "function": {"name": "get_weather", "arguments": {"city": "Berlin", "days_ahead": 0}}}]}  \n',
+            '{"tool_calls": []}  \n',
+            'show_emotion("happy")',
+        ], second_answer="It's going to be a bit rainy in Berlin today.")
+        city, kwargs = self.w.of("weather")[0][1:]
+        self.assertEqual((city, kwargs["forecast_days"]), ("Berlin", 1))
+        self.assertIn("Weather in Berlin: Slight rain", prompts[1])
+        self.assertEqual(self.w.spoken(), [
+            "Ah, you mean the weather today?",
+            "Well, let me check what\u2019s forecasted for now.",
+            "It's going to be a bit rainy in Berlin today.",
+        ])
+        self.assertNothingTechnicalSpoken()
+
+    def test_qwen_tool_call_tags(self):
+        self.w.http_routes = {"https://api.duckduckgo.com/": {"AbstractText": "Mount Everest is 8849 m high."}}
+        prompts = self.converse("How high is Mount Everest?", [
+            "<tool_call>\n", '{"name": "web_search", "arguments": {"query": "Mt. Everest height"}}', "\n</tool_call>",
+        ], second_answer="About eight thousand eight hundred meters.")
+        self.assertIn("8849", prompts[1])
+        self.assertIn(self.w.spoken()[0], self.m.SEARCH_FILLERS)  # nothing said yet, so a filler
+        self.assertEqual(self.w.spoken()[1], "About eight thousand eight hundred meters.")
+
+    def test_python_style_call_with_keywords(self):
+        self.converse("Weather in New York tomorrow?", ['get_weather(city="New York", days_ahead=1)'])
+        city, kwargs = self.w.of("weather")[0][1:]
+        self.assertEqual((city, kwargs["forecast_days"]), ("New York", 2))
+
+    def test_text_after_a_lookup_is_not_spoken(self):
+        self.converse("Who won?", ['web_search("who won the match")\n', "Team A won three to one. "],
+                      second_answer="I couldn't find it.")
+        self.assertNotIn("Team A won three to one.", self.w.spoken())
+
+    def test_gives_up_after_too_many_lookups(self):
+        self.w.http_routes = {"https://": ConnectionError("offline")}
+        self.converse("Something obscure?", ['web_search("thing")'], second_answer='web_search("thing again")')
+        self.assertEqual(len(self.w.of("llm")), self.m.MAX_LOOKUP_ROUNDS + 1)
+        self.assertEqual(self.w.spoken()[-1], "Sorry, I couldn't find that out right now.")
+
+    def test_splitter_keeps_actions_in_one_piece(self):
+        pieces, rest = self.m.split_speakable('First. web_search("Mt. Everest") Second! Third')
+        self.assertEqual(pieces, ["First.", ' web_search("Mt. Everest") Second!'])
+        self.assertEqual(rest, " Third")
+
+    def test_speech_recognition_language_is_fixed(self):
+        self.assertEqual(self.m.asr.language, self.m.ASR_LANGUAGE)
+        self.assertEqual(self.m.ASR_LANGUAGE, "en")
+        self.assertIn("Always answer in English", self.m.SYSTEM_PROMPT)
 
 
 class TestIdleFace(AssistantTestCase):

@@ -124,6 +124,7 @@ class _Chunk:
 
 class AutomaticSpeechRecognition:
     def __init__(self, mic=None, language=None):
+        self.language = language
         self.mic = mic if mic is not None else Microphone()
         self.mic.owner = "asr"
 
